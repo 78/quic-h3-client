@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Project specific directories
+tmp/
+
+# Log files
+*.log
+*.log.*
+
+# Session files
+/*_session.json
+/session_*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Key log files (may contain sensitive data)
+*_keys.log
+quic_keys*.log
+test_keys.log
+
