@@ -137,30 +137,33 @@ def build_quic_transport_params(scid: bytes) -> bytes:
     params += encode_varint(4)
     params += encode_varint(65536)
     
-    # initial_max_streams_bidi (0x08): 128
+    # initial_max_streams_bidi (0x08): 8 (reduced for embedded devices)
+    # Each stream needs state tracking, fewer streams = less memory
     params += encode_varint(0x08)
-    params += encode_varint(2)
-    params += encode_varint(128)
+    params += encode_varint(1)
+    params += encode_varint(8)
     
-    # initial_max_streams_uni (0x09): 128
+    # initial_max_streams_uni (0x09): 8 (reduced for embedded devices)
+    # HTTP/3 needs 3 uni streams (control, QPACK encoder/decoder)
     params += encode_varint(0x09)
-    params += encode_varint(2)
-    params += encode_varint(128)
+    params += encode_varint(1)
+    params += encode_varint(8)
     
     # ack_delay_exponent (0x0a): 3
     params += encode_varint(0x0a)
     params += encode_varint(1)
     params += encode_varint(3)
     
-    # max_ack_delay (0x0b): 25
+    # max_ack_delay (0x0b): 25ms
     params += encode_varint(0x0b)
     params += encode_varint(1)
     params += encode_varint(25)
     
-    # active_connection_id_limit (0x0e): 8
+    # active_connection_id_limit (0x0e): 2 (minimal for embedded devices)
+    # Fewer CIDs = less memory for tracking
     params += encode_varint(0x0e)
     params += encode_varint(1)
-    params += encode_varint(8)
+    params += encode_varint(2)
     
     # initial_source_connection_id (0x0f)
     params += encode_varint(0x0f)
