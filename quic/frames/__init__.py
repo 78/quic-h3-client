@@ -12,6 +12,8 @@ from .builders import (
     build_connection_close_frame,
     build_max_data_frame,
     build_max_stream_data_frame,
+    build_path_challenge_frame,
+    build_path_response_frame,
 )
 from .parsers import (
     parse_quic_frames,

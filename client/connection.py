@@ -30,6 +30,7 @@ from quic.frames import (
     build_stream_frame, build_new_connection_id_frame,
     build_retire_connection_id_frame, build_connection_close_frame,
     parse_quic_frames, build_max_data_frame, build_max_stream_data_frame,
+    build_path_challenge_frame, build_path_response_frame,
 )
 from quic.packets import (
     build_initial_packet_with_secrets, build_handshake_packet,
@@ -224,6 +225,11 @@ class RealtimeQUICClient:
         
         # Stateless reset flag
         self._stateless_reset_received: bool = False
+        
+        # Path validation state (for PATH_CHALLENGE/PATH_RESPONSE)
+        self._pending_path_challenges: List[dict] = []  # Pending challenges: {data, sent_time, pn}
+        self._path_validated: bool = True  # Path is initially valid after handshake
+        self._path_validation_time: float = 0.0  # When path was last validated
         
         # PTO timer task
         self._pto_timer_task: Optional[asyncio.Task] = None
@@ -1087,6 +1093,167 @@ class RealtimeQUICClient:
         
         # Mark connection as closed
         self.connection_closed.set()
+    
+    def send_path_challenge(self) -> bytes:
+        """
+        Send PATH_CHALLENGE frame for path validation.
+        
+        This is used to verify that the peer is still reachable,
+        particularly useful after network changes (e.g., switching from WiFi to cellular).
+        
+        Returns:
+            bytes: The 8-byte challenge data sent (for validation against response)
+        """
+        if not self.application_secrets:
+            if self.debug:
+                print(f"    ⚠️ Cannot send PATH_CHALLENGE: no application secrets")
+            return b""
+        
+        # Generate 8 random bytes for the challenge
+        challenge_data = os.urandom(8)
+        
+        # Store the pending challenge for validation
+        self._pending_path_challenges.append({
+            'data': challenge_data,
+            'sent_time': time.time(),
+            'pn': self.client_app_pn
+        })
+        
+        # Build PATH_CHALLENGE frame
+        challenge_frame = build_path_challenge_frame(challenge_data)
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        
+        # Build and send the 1-RTT packet with PATH_CHALLENGE
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, challenge_frame)
+        pn = self.client_app_pn
+        self.client_app_pn += 1
+        
+        self.send(packet)
+        
+        if self.debug:
+            print(f"    🛤️ Sent PATH_CHALLENGE: data={challenge_data.hex()} (pn={pn})")
+        
+        return challenge_data
+    
+    def _send_path_response(self, challenge_data: bytes):
+        """
+        Send PATH_RESPONSE frame in response to a received PATH_CHALLENGE.
+        
+        According to RFC 9000, an endpoint MUST respond to a PATH_CHALLENGE
+        by echoing the data in a PATH_RESPONSE frame.
+        
+        Args:
+            challenge_data: The 8-byte data from the received PATH_CHALLENGE
+        """
+        if not self.application_secrets:
+            if self.debug:
+                print(f"    ⚠️ Cannot send PATH_RESPONSE: no application secrets")
+            return
+        
+        # Build PATH_RESPONSE frame
+        response_frame = build_path_response_frame(challenge_data)
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        
+        # Build and send the 1-RTT packet with PATH_RESPONSE
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, response_frame)
+        pn = self.client_app_pn
+        self.client_app_pn += 1
+        
+        self.send(packet)
+        
+        if self.debug:
+            print(f"    🛤️ Sent PATH_RESPONSE: data={challenge_data.hex()} (pn={pn})")
+    
+    def _handle_path_response(self, response_data: bytes):
+        """
+        Handle received PATH_RESPONSE frame.
+        
+        Validates that the response matches a pending PATH_CHALLENGE.
+        
+        Args:
+            response_data: The 8-byte data from the received PATH_RESPONSE
+        """
+        # Find matching pending challenge
+        matched = False
+        for i, challenge in enumerate(self._pending_path_challenges):
+            if challenge['data'] == response_data:
+                matched = True
+                rtt = time.time() - challenge['sent_time']
+                if self.debug:
+                    print(f"        ✅ Path validated! RTT={rtt*1000:.2f}ms")
+                # Remove matched challenge
+                self._pending_path_challenges.pop(i)
+                # Mark path as validated
+                self._path_validated = True
+                self._path_validation_time = time.time()
+                break
+        
+        if not matched and self.debug:
+            print(f"        ⚠️ PATH_RESPONSE does not match any pending challenge")
+    
+    def validate_path(self, timeout: float = 3.0) -> bool:
+        """
+        Perform path validation by sending PATH_CHALLENGE and waiting for response.
+        
+        This is useful after network changes to verify the path is still valid.
+        
+        Args:
+            timeout: Maximum time to wait for PATH_RESPONSE (seconds)
+            
+        Returns:
+            bool: True if path validation succeeded, False otherwise
+        """
+        import asyncio
+        
+        # Send PATH_CHALLENGE
+        challenge_data = self.send_path_challenge()
+        if not challenge_data:
+            return False
+        
+        # Wait for response
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # Check if we received matching response
+            if not any(c['data'] == challenge_data for c in self._pending_path_challenges):
+                # Challenge was matched and removed
+                return True
+            # Small sleep to avoid busy waiting
+            time.sleep(0.01)
+        
+        if self.debug:
+            print(f"    ⚠️ Path validation timeout after {timeout}s")
+        return False
+    
+    async def validate_path_async(self, timeout: float = 3.0) -> bool:
+        """
+        Async version of path validation.
+        
+        Args:
+            timeout: Maximum time to wait for PATH_RESPONSE (seconds)
+            
+        Returns:
+            bool: True if path validation succeeded, False otherwise
+        """
+        # Send PATH_CHALLENGE
+        challenge_data = self.send_path_challenge()
+        if not challenge_data:
+            return False
+        
+        # Wait for response
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # Check if we received matching response
+            if not any(c['data'] == challenge_data for c in self._pending_path_challenges):
+                # Challenge was matched and removed
+                return True
+            # Small sleep to avoid busy waiting
+            await asyncio.sleep(0.01)
+        
+        if self.debug:
+            print(f"    ⚠️ Path validation timeout after {timeout}s")
+        return False
     
     def _derive_initial_keys(self):
         """Derive Initial encryption keys."""
@@ -2546,6 +2713,32 @@ class RealtimeQUICClient:
                     print(f"        STREAM_DATA_BLOCKED: stream={blocked_stream_id}, limit={blocked_at}")
                 # Peer is blocked on this stream - send MAX_STREAM_DATA immediately
                 self._send_max_stream_data_update(blocked_stream_id, force=True)
+            elif frame_type == 0x1a:  # PATH_CHALLENGE
+                ack_eliciting = True
+                # PATH_CHALLENGE contains exactly 8 bytes of data
+                if offset + 8 > len(payload):
+                    if self.debug:
+                        print(f"        ⚠️ PATH_CHALLENGE: insufficient data")
+                    break
+                challenge_data = payload[offset:offset + 8]
+                offset += 8
+                if self.debug:
+                    print(f"        🛤️ PATH_CHALLENGE: data={challenge_data.hex()}")
+                # Respond with PATH_RESPONSE immediately
+                self._send_path_response(challenge_data)
+            elif frame_type == 0x1b:  # PATH_RESPONSE
+                ack_eliciting = True
+                # PATH_RESPONSE contains exactly 8 bytes of data
+                if offset + 8 > len(payload):
+                    if self.debug:
+                        print(f"        ⚠️ PATH_RESPONSE: insufficient data")
+                    break
+                response_data = payload[offset:offset + 8]
+                offset += 8
+                if self.debug:
+                    print(f"        🛤️ PATH_RESPONSE: data={response_data.hex()}")
+                # Validate the response matches our pending challenge
+                self._handle_path_response(response_data)
             else:
                 if self.debug:
                     print(f"        Unknown frame type: 0x{frame_type:02x}")

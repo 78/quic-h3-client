@@ -458,7 +458,7 @@ async def http3_chat_stream(hostname: str, port: int, ogg_file: str,
             print(f"    Handshake packets received: {len(client.handshake_tracker.received_pns)}")
             
             # Send HTTP/3 POST request using streaming API
-            print(f"\n[4] Sending HTTP/3 POST request to /pocket-sage/chat/stream...")
+            print(f"\n[4] Opening stream for /pocket-sage/chat/stream...")
             print("-" * 40)
             
             import time
@@ -480,6 +480,36 @@ async def http3_chat_stream(hostname: str, port: int, ogg_file: str,
                     "accept": "text/plain",  # SSE response expected
                 },
             )
+            
+            # ============================================================
+            # PATH VALIDATION TEST: Wait 10 seconds for network switch
+            # ============================================================
+            print(f"\n[4.1] 🛤️ PATH VALIDATION TEST")
+            print(f"      Stream opened, waiting 10 seconds for network switch...")
+            print(f"      Switch your network now (e.g., WiFi -> Cellular)")
+            print("-" * 40)
+            
+            # Wait 10 seconds, sending periodic PATH_CHALLENGE to maintain connection
+            for i in range(10, 0, -1):
+                print(f"      ⏱️ {i}s remaining... ", end="", flush=True)
+                
+                # Send PATH_CHALLENGE every 2 seconds to probe path
+                if i % 2 == 0:
+                    challenge_data = client.send_path_challenge()
+                    if challenge_data:
+                        print(f"(sent PATH_CHALLENGE: {challenge_data.hex()[:8]}...)")
+                    else:
+                        print()
+                else:
+                    print()
+                
+                await asyncio.sleep(1.0)
+            
+            print(f"\n      ✅ Wait complete. Continuing with upload...")
+            print(f"      Path validated: {client._path_validated}")
+            print("-" * 40)
+            
+            print(f"\n[4.2] Uploading audio data...")
             
             # Write body data in chunks
             CHUNK_SIZE = 10000  # 10KB per write (conservative for flow control)

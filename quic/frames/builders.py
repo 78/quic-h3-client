@@ -268,3 +268,63 @@ def build_connection_close_frame(error_code: int = 0, frame_type: int = None,
     
     return frame
 
+
+def build_path_challenge_frame(data: bytes) -> bytes:
+    """
+    Build QUIC PATH_CHALLENGE frame (RFC 9000 Section 19.17).
+    
+    Frame Type: 0x1a
+    
+    PATH_CHALLENGE frames are used to check reachability to the peer
+    and for path validation during connection migration.
+    
+    Frame format:
+    - Type (varint): 0x1a
+    - Data (8 bytes): Arbitrary data to be echoed in PATH_RESPONSE
+    
+    Args:
+        data: 8 bytes of arbitrary data
+        
+    Returns:
+        bytes: Complete PATH_CHALLENGE frame
+        
+    Raises:
+        ValueError: If data is not exactly 8 bytes
+    """
+    if len(data) != 8:
+        raise ValueError(f"PATH_CHALLENGE data must be exactly 8 bytes, got {len(data)}")
+    
+    frame = encode_varint(0x1a)  # Frame type: PATH_CHALLENGE
+    frame += data
+    return frame
+
+
+def build_path_response_frame(data: bytes) -> bytes:
+    """
+    Build QUIC PATH_RESPONSE frame (RFC 9000 Section 19.18).
+    
+    Frame Type: 0x1b
+    
+    PATH_RESPONSE frames are sent in response to PATH_CHALLENGE frames.
+    The data field must contain the same data received in the PATH_CHALLENGE.
+    
+    Frame format:
+    - Type (varint): 0x1b
+    - Data (8 bytes): Data from received PATH_CHALLENGE
+    
+    Args:
+        data: 8 bytes of data copied from PATH_CHALLENGE
+        
+    Returns:
+        bytes: Complete PATH_RESPONSE frame
+        
+    Raises:
+        ValueError: If data is not exactly 8 bytes
+    """
+    if len(data) != 8:
+        raise ValueError(f"PATH_RESPONSE data must be exactly 8 bytes, got {len(data)}")
+    
+    frame = encode_varint(0x1b)  # Frame type: PATH_RESPONSE
+    frame += data
+    return frame
+

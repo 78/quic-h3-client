@@ -61,6 +61,11 @@
   - NEW_CONNECTION_ID 帧发送和接收
   - RETIRE_CONNECTION_ID 帧处理（自动和手动）
   - 根据 `retire_prior_to` 自动退休旧连接 ID
+- ✅ **路径验证**: 
+  - PATH_CHALLENGE (0x1a) 帧发送和接收
+  - PATH_RESPONSE (0x1b) 帧自动响应
+  - 主动路径验证 API (`send_path_challenge()`, `validate_path_async()`)
+  - 支持网络切换场景的路径探测
 
 #### 流控制
 - ✅ **连接级流控**: MAX_DATA 帧
@@ -97,6 +102,8 @@
 - ✅ MAX_STREAMS_UNI (0x13)
 - ✅ NEW_CONNECTION_ID (0x18)
 - ✅ RETIRE_CONNECTION_ID (0x19)
+- ✅ PATH_CHALLENGE (0x1a)
+- ✅ PATH_RESPONSE (0x1b)
 - ✅ CONNECTION_CLOSE (0x1c)
 - ✅ CONNECTION_CLOSE_APP (0x1d)
 - ✅ HANDSHAKE_DONE (0x1e)
@@ -147,14 +154,6 @@
 
 **影响**: 在某些网络环境下，高级算法可能提供更好的性能
 
-#### 🟡 连接迁移
-- ❌ **PATH_CHALLENGE (0x1a)**: 路径挑战帧
-- ❌ **PATH_RESPONSE (0x1b)**: 路径响应帧
-- ❌ **网络切换检测**: WiFi → 4G 等场景
-- ❌ **新路径验证**: 连接迁移时的路径验证
-
-**影响**: 无法在网络切换时保持连接
-
 ---
 
 ### 低优先级（可选实现）
@@ -180,6 +179,12 @@
 - ❌ **请求头 Huffman 编码**: 发送请求时压缩字符串
 
 **当前状态**: 只有解码，编码用原始字符串
+
+**影响**: 对嵌入式设备影响很小
+- API 请求头通常很短，Huffman 压缩收益有限（可能只节省几个字节）
+- 编码需要额外的 CPU 和内存开销，收益不明显
+- 2Mbps 带宽对 API 请求已足够
+- 解码已实现，不影响接收服务器响应
 
 #### 🟢 ECN 支持
 - ❌ **ACK_ECN (0x03)**: 显式拥塞通知
@@ -295,7 +300,7 @@ http3-client/
 
 ### 已知限制
 
-1. **无连接迁移**: 网络切换时需要重新连接
+1. **连接迁移**: 已支持 PATH_CHALLENGE/PATH_RESPONSE 路径验证，但网络切换时可能需要手动重建 socket
 2. **无 Server Push**: 不支持服务器推送
 3. **QPACK 编码**: 只使用静态表，压缩率有限
 4. **拥塞控制算法**: 使用基础的 NewReno 算法，未实现 Cubic/BBR 等高级算法
@@ -329,6 +334,13 @@ http3-client/
 ## 📝 更新日志
 
 ### 最新更新
+- ✅ 实现 PATH_CHALLENGE 和 PATH_RESPONSE（RFC 9000 Section 19.17-19.18）
+  - 支持发送和接收 PATH_CHALLENGE (0x1a) 帧
+  - 自动响应服务器发送的 PATH_CHALLENGE，发送 PATH_RESPONSE (0x1b) 帧
+  - 实现 `send_path_challenge()` 方法主动发送路径挑战
+  - 实现 `validate_path_async()` 方法进行异步路径验证
+  - 支持网络切换场景的路径探测和验证
+  - 在 `--chat` 测试中添加路径验证测试（10 秒等待期）
 - ✅ 实现 GOAWAY（RFC 9114 Section 5.2）
   - 支持发送和接收 GOAWAY 帧
   - 实现 `send_goaway()` 方法发送 GOAWAY 帧
