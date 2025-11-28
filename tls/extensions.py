@@ -115,25 +115,27 @@ def build_quic_transport_params(scid: bytes) -> bytes:
     params += encode_varint(4)      # length
     params += encode_varint(60000)  # value
     
-    # initial_max_data (0x04): 1048576
+    # initial_max_data (0x04): 65536 (64KB - for 2Mbps embedded devices)
+    # Formula: 2 × BDP, where BDP = bandwidth × RTT
+    # 2Mbps × 200ms = 50KB, so 64KB provides good headroom
     params += encode_varint(0x04)
     params += encode_varint(4)
-    params += encode_varint(1048576)
+    params += encode_varint(65536)
     
-    # initial_max_stream_data_bidi_local (0x05): 1048576
+    # initial_max_stream_data_bidi_local (0x05): 65536 (64KB)
     params += encode_varint(0x05)
     params += encode_varint(4)
-    params += encode_varint(1048576)
+    params += encode_varint(65536)
     
-    # initial_max_stream_data_bidi_remote (0x06): 1048576
+    # initial_max_stream_data_bidi_remote (0x06): 65536 (64KB)
     params += encode_varint(0x06)
     params += encode_varint(4)
-    params += encode_varint(1048576)
+    params += encode_varint(65536)
     
-    # initial_max_stream_data_uni (0x07): 1048576
+    # initial_max_stream_data_uni (0x07): 65536 (64KB)
     params += encode_varint(0x07)
     params += encode_varint(4)
-    params += encode_varint(1048576)
+    params += encode_varint(65536)
     
     # initial_max_streams_bidi (0x08): 128
     params += encode_varint(0x08)

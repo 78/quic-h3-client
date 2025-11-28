@@ -28,6 +28,7 @@ from quic.frames import (
     build_crypto_frame, build_ack_frame, build_padding_frame,
     build_stream_frame, build_new_connection_id_frame,
     build_connection_close_frame, parse_quic_frames,
+    build_max_data_frame, build_max_stream_data_frame,
 )
 from quic.packets import (
     build_initial_packet_with_secrets, build_handshake_packet,
@@ -191,6 +192,21 @@ class RealtimeQUICClient:
         
         # Stream data for retransmission (stream_id -> {offset: data})
         self._pending_stream_data: Dict[int, Dict[int, bytes]] = {}
+        
+        # Flow control state - connection level
+        # Initial values from QUIC transport parameters (see tls/extensions.py)
+        # For embedded devices with 2Mbps bandwidth:
+        #   BDP = 2Mbps × 200ms = 50KB, recommend 2×BDP = ~64KB
+        # For high-bandwidth devices: use 1MB (1048576)
+        self._fc_initial_max_data = 65536  # 64KB - suitable for 2Mbps embedded devices
+        self._fc_max_data_sent = self._fc_initial_max_data  # Last MAX_DATA value sent to peer
+        self._fc_data_received = 0  # Total bytes received on all streams
+        self._fc_window_update_threshold = 0.5  # Update when 50% consumed
+        
+        # Flow control state - per stream level
+        self._fc_initial_max_stream_data = 65536  # 64KB - suitable for 2Mbps embedded devices
+        self._fc_stream_max_sent: Dict[int, int] = {}  # stream_id -> last MAX_STREAM_DATA sent
+        self._fc_stream_received: Dict[int, int] = {}  # stream_id -> bytes received on stream
         
     async def connect(self):
         """Resolve hostname and create UDP socket."""
@@ -1820,9 +1836,30 @@ class RealtimeQUICClient:
                     # Send any pending QPACK decoder instructions
                     self._send_qpack_decoder_instructions()
                     
+                    # Update flow control and send window updates if needed
+                    self._update_flow_control(stream_id, len(stream_data))
+                    
                 except Exception as e:
                     if self.debug:
                         print(f"          ⚠️ H3 parsing error: {e}")
+            elif frame_type == 0x14:  # DATA_BLOCKED
+                ack_eliciting = True
+                blocked_at, consumed = decode_varint(payload, offset)
+                offset += consumed
+                if self.debug:
+                    print(f"        DATA_BLOCKED: limit={blocked_at}")
+                # Peer is blocked - send MAX_DATA immediately
+                self._send_max_data_update(force=True)
+            elif frame_type == 0x15:  # STREAM_DATA_BLOCKED
+                ack_eliciting = True
+                blocked_stream_id, consumed = decode_varint(payload, offset)
+                offset += consumed
+                blocked_at, consumed = decode_varint(payload, offset)
+                offset += consumed
+                if self.debug:
+                    print(f"        STREAM_DATA_BLOCKED: stream={blocked_stream_id}, limit={blocked_at}")
+                # Peer is blocked on this stream - send MAX_STREAM_DATA immediately
+                self._send_max_stream_data_update(blocked_stream_id, force=True)
             else:
                 if self.debug:
                     print(f"        Unknown frame type: 0x{frame_type:02x}")
@@ -1862,6 +1899,109 @@ class RealtimeQUICClient:
         
         if self.debug:
             print(f"    → Sent QPACK decoder instructions ({len(instructions)} bytes)")
+    
+    def _update_flow_control(self, stream_id: int, data_len: int):
+        """
+        Update flow control counters and send window updates if needed.
+        
+        Args:
+            stream_id: The stream that received data
+            data_len: Number of bytes received
+        """
+        # Update connection-level counter
+        self._fc_data_received += data_len
+        
+        # Update stream-level counter
+        if stream_id not in self._fc_stream_received:
+            self._fc_stream_received[stream_id] = 0
+            self._fc_stream_max_sent[stream_id] = self._fc_initial_max_stream_data
+        self._fc_stream_received[stream_id] += data_len
+        
+        # Check if we need to send MAX_DATA
+        self._send_max_data_update()
+        
+        # Check if we need to send MAX_STREAM_DATA
+        self._send_max_stream_data_update(stream_id)
+    
+    def _send_max_data_update(self, force: bool = False):
+        """
+        Send MAX_DATA frame if the peer has consumed enough of the window.
+        
+        Args:
+            force: If True, send update immediately regardless of threshold
+        """
+        if not self.application_secrets:
+            return
+        
+        # Calculate how much of the window has been consumed
+        consumed = self._fc_data_received
+        current_limit = self._fc_max_data_sent
+        
+        # Send update when consumed > threshold * current_limit
+        threshold_reached = consumed > (self._fc_window_update_threshold * current_limit)
+        
+        if force or threshold_reached:
+            # Double the window or add initial window size
+            new_limit = max(
+                current_limit + self._fc_initial_max_data,
+                consumed + self._fc_initial_max_data
+            )
+            
+            if new_limit > self._fc_max_data_sent:
+                self._fc_max_data_sent = new_limit
+                
+                # Build and send MAX_DATA frame
+                max_data_frame = build_max_data_frame(new_limit)
+                dcid = self.server_scid if self.server_scid else self.original_dcid
+                packet = self._build_short_header_packet(dcid, self.client_app_pn, max_data_frame)
+                self.send(packet)
+                self.client_app_pn += 1
+                
+                if self.debug:
+                    print(f"    → Sent MAX_DATA: {new_limit} (received={consumed})")
+    
+    def _send_max_stream_data_update(self, stream_id: int, force: bool = False):
+        """
+        Send MAX_STREAM_DATA frame if the peer has consumed enough of the stream window.
+        
+        Args:
+            stream_id: The stream to update
+            force: If True, send update immediately regardless of threshold
+        """
+        if not self.application_secrets:
+            return
+        
+        # Initialize if needed
+        if stream_id not in self._fc_stream_received:
+            self._fc_stream_received[stream_id] = 0
+            self._fc_stream_max_sent[stream_id] = self._fc_initial_max_stream_data
+        
+        # Calculate how much of the window has been consumed
+        consumed = self._fc_stream_received[stream_id]
+        current_limit = self._fc_stream_max_sent[stream_id]
+        
+        # Send update when consumed > threshold * current_limit
+        threshold_reached = consumed > (self._fc_window_update_threshold * current_limit)
+        
+        if force or threshold_reached:
+            # Increase window
+            new_limit = max(
+                current_limit + self._fc_initial_max_stream_data,
+                consumed + self._fc_initial_max_stream_data
+            )
+            
+            if new_limit > self._fc_stream_max_sent[stream_id]:
+                self._fc_stream_max_sent[stream_id] = new_limit
+                
+                # Build and send MAX_STREAM_DATA frame
+                max_stream_data_frame = build_max_stream_data_frame(stream_id, new_limit)
+                dcid = self.server_scid if self.server_scid else self.original_dcid
+                packet = self._build_short_header_packet(dcid, self.client_app_pn, max_stream_data_frame)
+                self.send(packet)
+                self.client_app_pn += 1
+                
+                if self.debug:
+                    print(f"    → Sent MAX_STREAM_DATA: stream={stream_id}, limit={new_limit} (received={consumed})")
     
     def _send_1rtt_ack(self):
         """Send ACK for 1-RTT packets using Short Header."""

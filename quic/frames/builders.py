@@ -168,6 +168,48 @@ def build_new_connection_id_frame(sequence: int, retire_prior_to: int,
     return frame
 
 
+def build_max_data_frame(max_data: int) -> bytes:
+    """
+    Build QUIC MAX_DATA frame for connection-level flow control.
+    
+    Frame Type: 0x10
+    
+    This frame informs the peer of the maximum amount of data that can be 
+    sent on the connection as a whole.
+    
+    Args:
+        max_data: The new maximum data limit (cumulative)
+        
+    Returns:
+        bytes: Complete MAX_DATA frame
+    """
+    frame = encode_varint(0x10)  # Frame type: MAX_DATA
+    frame += encode_varint(max_data)
+    return frame
+
+
+def build_max_stream_data_frame(stream_id: int, max_stream_data: int) -> bytes:
+    """
+    Build QUIC MAX_STREAM_DATA frame for stream-level flow control.
+    
+    Frame Type: 0x11
+    
+    This frame informs the peer of the maximum amount of data that can be 
+    sent on a specific stream.
+    
+    Args:
+        stream_id: The stream ID
+        max_stream_data: The new maximum data limit for this stream (cumulative)
+        
+    Returns:
+        bytes: Complete MAX_STREAM_DATA frame
+    """
+    frame = encode_varint(0x11)  # Frame type: MAX_STREAM_DATA
+    frame += encode_varint(stream_id)
+    frame += encode_varint(max_stream_data)
+    return frame
+
+
 def build_connection_close_frame(error_code: int = 0, frame_type: int = None, 
                                   reason: str = "", is_application: bool = False) -> bytes:
     """
