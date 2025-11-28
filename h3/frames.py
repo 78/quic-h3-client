@@ -699,7 +699,7 @@ def decode_qpack_string(data: bytes, offset: int) -> tuple:
         return string_bytes.hex(), len_consumed + length
 
 
-def decode_qpack_headers(data: bytes, debug: bool = False, dynamic_table=None) -> list:
+def decode_qpack_headers(data: bytes, debug: bool = False, dynamic_table=None) -> tuple:
     """
     Decode QPACK encoded headers (RFC 9204).
     
@@ -709,13 +709,16 @@ def decode_qpack_headers(data: bytes, debug: bool = False, dynamic_table=None) -
         dynamic_table: QPACKDynamicTable instance for dynamic table lookups
         
     Returns:
-        list: List of (name, value) tuples
+        tuple: (headers_list, req_insert_count)
+            - headers_list: List of (name, value) tuples
+            - req_insert_count: Required Insert Count from header block prefix
+              (used to determine if Section Acknowledgment should be sent)
     """
     headers = []
     offset = 0
     
     if len(data) < 2:
-        return headers
+        return headers, 0
     
     # Required Insert Count (prefix 8) - RFC 9204 Section 4.5.1
     # Encoded Required Insert Count (ERIC)
@@ -724,7 +727,7 @@ def decode_qpack_headers(data: bytes, debug: bool = False, dynamic_table=None) -
     
     # Sign bit and Delta Base (prefix 7)
     if offset >= len(data):
-        return headers
+        return headers, 0
     sign = (data[offset] & 0x80) != 0
     delta_base, consumed = decode_qpack_int(data, offset, 7)
     offset += consumed
@@ -948,5 +951,5 @@ def decode_qpack_headers(data: bytes, debug: bool = False, dynamic_table=None) -
             if debug:
                 print(f"          [post-base-name:{name_idx}]: {value}")
     
-    return headers
+    return headers, req_insert_count
 

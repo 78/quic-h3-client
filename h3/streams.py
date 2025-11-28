@@ -349,7 +349,7 @@ class H3StreamManager:
             
             if frame_type == 0x01:  # HEADERS
                 # Decode headers with dynamic table support
-                headers = decode_qpack_headers(
+                headers, req_insert_count = decode_qpack_headers(
                     payload, 
                     debug=debug, 
                     dynamic_table=self.qpack_dynamic_table
@@ -361,10 +361,13 @@ class H3StreamManager:
                     for name, value in headers:
                         print(f"             {name}: {value}")
                 
-                # Send Section Acknowledgment for this header block
-                self._pending_decoder_instructions.extend(
-                    build_section_acknowledgment(stream_id)
-                )
+                # Send Section Acknowledgment only if header block uses dynamic table
+                # RFC 9204 Section 4.4.1: "When the Required Insert Count of the header
+                # block is zero, the Section Acknowledgment MUST NOT be sent."
+                if req_insert_count > 0:
+                    self._pending_decoder_instructions.extend(
+                        build_section_acknowledgment(stream_id)
+                    )
                 
                 results.append({
                     "type": "response_headers",
