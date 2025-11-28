@@ -2,8 +2,14 @@
 QUIC AEAD Encryption/Decryption and Header Protection (RFC 9001)
 """
 
+import struct
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+# Retry Integrity Tag secrets (RFC 9001 Section 5.8)
+# These are fixed values for QUIC version 1
+RETRY_INTEGRITY_KEY = bytes.fromhex("be0c690b9f66575a1d766b54e368c84e")
+RETRY_INTEGRITY_NONCE = bytes.fromhex("461599d35d632bf2239825bb")
 
 
 def encrypt_payload(secrets: dict, packet_number: int, header: bytes, payload: bytes) -> bytes:
@@ -145,4 +151,73 @@ def remove_header_protection(secrets: dict, packet: bytes, pn_offset: int) -> tu
     unprotected_header = bytes([unmasked_first]) + packet[1:pn_offset] + bytes(pn_bytes)
     
     return unprotected_header, packet_number, pn_length
+
+
+def compute_retry_integrity_tag(retry_pseudo_packet: bytes) -> bytes:
+    """
+    Compute the Retry Integrity Tag for a Retry packet (RFC 9001 Section 5.8).
+    
+    The Retry Pseudo-Packet is:
+    - ODCID Length (1 byte)
+    - Original Destination Connection ID (0..160)
+    - Retry packet without the integrity tag
+    
+    Args:
+        retry_pseudo_packet: The Retry Pseudo-Packet
+        
+    Returns:
+        bytes: 16-byte integrity tag
+    """
+    aesgcm = AESGCM(RETRY_INTEGRITY_KEY)
+    # AEAD encrypt empty plaintext with pseudo-packet as AAD
+    # Returns just the authentication tag (16 bytes)
+    ciphertext = aesgcm.encrypt(RETRY_INTEGRITY_NONCE, b"", retry_pseudo_packet)
+    return ciphertext  # This is just the 16-byte tag since plaintext is empty
+
+
+def verify_retry_integrity_tag(retry_packet: bytes, original_dcid: bytes) -> bool:
+    """
+    Verify the integrity tag of a Retry packet (RFC 9001 Section 5.8).
+    
+    Args:
+        retry_packet: Complete Retry packet including integrity tag
+        original_dcid: Original Destination Connection ID sent by client
+        
+    Returns:
+        bool: True if integrity tag is valid
+    """
+    if len(retry_packet) < 16:
+        return False
+    
+    # Extract the integrity tag (last 16 bytes)
+    received_tag = retry_packet[-16:]
+    retry_without_tag = retry_packet[:-16]
+    
+    # Build Retry Pseudo-Packet:
+    # - ODCID Length (1 byte)
+    # - Original DCID (variable)
+    # - Retry packet header and token (without integrity tag)
+    pseudo_packet = struct.pack("B", len(original_dcid)) + original_dcid + retry_without_tag
+    
+    # Compute expected tag
+    expected_tag = compute_retry_integrity_tag(pseudo_packet)
+    
+    # Constant-time comparison
+    return expected_tag == received_tag
+
+
+def build_retry_integrity_tag(retry_packet_without_tag: bytes, original_dcid: bytes) -> bytes:
+    """
+    Build the integrity tag for a Retry packet (for testing/server implementation).
+    
+    Args:
+        retry_packet_without_tag: Retry packet header + token (without the integrity tag)
+        original_dcid: Original Destination Connection ID from client
+        
+    Returns:
+        bytes: 16-byte integrity tag to append to the Retry packet
+    """
+    # Build Retry Pseudo-Packet
+    pseudo_packet = struct.pack("B", len(original_dcid)) + original_dcid + retry_packet_without_tag
+    return compute_retry_integrity_tag(pseudo_packet)
 

@@ -481,34 +481,6 @@ async def http3_chat_stream(hostname: str, port: int, ogg_file: str,
                 },
             )
             
-            # ============================================================
-            # PATH VALIDATION TEST: Wait 10 seconds for network switch
-            # ============================================================
-            print(f"\n[4.1] 🛤️ PATH VALIDATION TEST")
-            print(f"      Stream opened, waiting 10 seconds for network switch...")
-            print(f"      Switch your network now (e.g., WiFi -> Cellular)")
-            print("-" * 40)
-            
-            # Wait 10 seconds, sending periodic PATH_CHALLENGE to maintain connection
-            for i in range(10, 0, -1):
-                print(f"      ⏱️ {i}s remaining... ", end="", flush=True)
-                
-                # Send PATH_CHALLENGE every 2 seconds to probe path
-                if i % 2 == 0:
-                    challenge_data = client.send_path_challenge()
-                    if challenge_data:
-                        print(f"(sent PATH_CHALLENGE: {challenge_data.hex()[:8]}...)")
-                    else:
-                        print()
-                else:
-                    print()
-                
-                await asyncio.sleep(1.0)
-            
-            print(f"\n      ✅ Wait complete. Continuing with upload...")
-            print(f"      Path validated: {client._path_validated}")
-            print("-" * 40)
-            
             print(f"\n[4.2] Uploading audio data...")
             
             # Write body data in chunks

@@ -4,9 +4,9 @@ QUIC Packet Parsers (RFC 9000)
 
 import struct
 from ..varint import decode_varint
-from ..constants import PACKET_TYPE_NAMES
+from ..constants import PACKET_TYPE_NAMES, QUIC_VERSION
 from ..crypto.keys import derive_server_initial_secrets
-from ..crypto.aead import remove_header_protection, decrypt_payload
+from ..crypto.aead import remove_header_protection, decrypt_payload, verify_retry_integrity_tag
 from ..frames.parsers import parse_quic_frames
 
 
@@ -265,6 +265,134 @@ def decrypt_server_handshake(packet: bytes, handshake_secrets: dict,
     result["frames"] = decrypt_result["frames"]
     result["success"] = decrypt_result["success"]
     result["error"] = decrypt_result.get("error")
+    
+    return result
+
+
+def parse_retry_packet(packet: bytes, original_dcid: bytes, debug: bool = True) -> dict:
+    """
+    Parse and validate a QUIC Retry packet (RFC 9000 Section 17.2.5).
+    
+    Retry Packet format:
+    - Header Form (1) = 1
+    - Fixed Bit (1) = 1  
+    - Long Packet Type (2) = 3
+    - Unused (4)
+    - Version (32)
+    - Destination Connection ID Length (8)
+    - Destination Connection ID (0..160)
+    - Source Connection ID Length (8)
+    - Source Connection ID (0..160)
+    - Retry Token (..)
+    - Retry Integrity Tag (128) - last 16 bytes
+    
+    Args:
+        packet: Raw Retry packet bytes
+        original_dcid: Original DCID sent by client (for integrity validation)
+        debug: Enable debug output
+        
+    Returns:
+        dict: {
+            success: bool,
+            dcid: str (hex),
+            dcid_bytes: bytes,
+            scid: str (hex),
+            scid_bytes: bytes,
+            retry_token: bytes,
+            error: str or None
+        }
+    """
+    result = {
+        "success": False,
+        "dcid": None,
+        "dcid_bytes": None,
+        "scid": None,
+        "scid_bytes": None,
+        "retry_token": None,
+        "error": None
+    }
+    
+    # Minimum Retry packet size: 1 (header) + 4 (version) + 1 (dcid_len) + 1 (scid_len) + 16 (tag) = 23
+    if len(packet) < 23:
+        result["error"] = "Packet too short for Retry"
+        return result
+    
+    first_byte = packet[0]
+    
+    # Validate header form and fixed bit
+    if not (first_byte & 0x80):
+        result["error"] = "Not a Long Header packet"
+        return result
+    
+    if not (first_byte & 0x40):
+        result["error"] = "Fixed Bit not set"
+        return result
+    
+    # Validate packet type (should be 3 for Retry)
+    packet_type = (first_byte & 0x30) >> 4
+    if packet_type != 3:
+        result["error"] = f"Not a Retry packet (type={packet_type})"
+        return result
+    
+    # Parse version
+    version = struct.unpack(">I", packet[1:5])[0]
+    if version != QUIC_VERSION:
+        result["error"] = f"Version mismatch: expected 0x{QUIC_VERSION:08x}, got 0x{version:08x}"
+        return result
+    
+    # Parse DCID
+    dcid_len = packet[5]
+    if len(packet) < 7 + dcid_len:
+        result["error"] = "Packet too short for DCID"
+        return result
+    
+    dcid = packet[6:6 + dcid_len]
+    result["dcid"] = dcid.hex()
+    result["dcid_bytes"] = dcid
+    
+    # Parse SCID
+    scid_len_offset = 6 + dcid_len
+    scid_len = packet[scid_len_offset]
+    scid_start = scid_len_offset + 1
+    
+    if len(packet) < scid_start + scid_len + 16:  # +16 for integrity tag
+        result["error"] = "Packet too short for SCID and integrity tag"
+        return result
+    
+    scid = packet[scid_start:scid_start + scid_len]
+    result["scid"] = scid.hex()
+    result["scid_bytes"] = scid
+    
+    # Extract Retry Token (everything between SCID and integrity tag)
+    token_start = scid_start + scid_len
+    token_end = len(packet) - 16  # Last 16 bytes are integrity tag
+    
+    if token_end <= token_start:
+        result["error"] = "No Retry Token in packet"
+        return result
+    
+    retry_token = packet[token_start:token_end]
+    integrity_tag = packet[token_end:]
+    
+    if debug:
+        print(f"    Retry packet parsed:")
+        print(f"      DCID: {result['dcid']}")
+        print(f"      SCID: {result['scid']}")
+        print(f"      Retry Token length: {len(retry_token)} bytes")
+        print(f"      Integrity Tag: {integrity_tag.hex()}")
+    
+    # Verify integrity tag (RFC 9001 Section 5.8)
+    if not verify_retry_integrity_tag(packet, original_dcid):
+        result["error"] = "Retry Integrity Tag validation failed"
+        if debug:
+            print(f"      ❌ Integrity tag validation FAILED")
+        return result
+    
+    if debug:
+        print(f"      ✓ Integrity tag validation passed")
+    
+    result["retry_token"] = retry_token
+    result["success"] = True
     
     return result
 

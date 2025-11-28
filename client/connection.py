@@ -36,6 +36,7 @@ from quic.packets import (
     build_initial_packet_with_secrets, build_handshake_packet,
     create_initial_packet, parse_long_header,
     build_0rtt_packet, create_initial_packet_with_psk,
+    parse_retry_packet, create_initial_packet_with_retry_token,
 )
 from tls.handshake import parse_tls_handshake
 from tls.session import SessionTicket, SessionTicketStore
@@ -159,7 +160,9 @@ class RealtimeQUICClient:
             0x07: 0,    # QPACK_BLOCKED_STREAMS (Typically 16 for high-bandwidth devices)
             0x08: 0,    # EXTENDED_CONNECT (Typically 1 for WebTransport)
         }
-        self.h3_max_push_id = 8
+        # Server Push is deprecated in practice (though still in RFC 9114)
+        # Set to 0 to explicitly disable server push
+        self.h3_max_push_id = 0
         
         # GOAWAY state - graceful connection shutdown (RFC 9114 Section 5.2)
         self.goaway_received = False      # True if peer sent GOAWAY
@@ -225,6 +228,11 @@ class RealtimeQUICClient:
         
         # Stateless reset flag
         self._stateless_reset_received: bool = False
+        
+        # Retry packet state (RFC 9000 Section 17.2.5)
+        self._retry_received: bool = False  # True if server sent Retry packet
+        self._retry_source_cid: Optional[bytes] = None  # SCID from Retry packet
+        self._retry_token: Optional[bytes] = None  # Token from Retry packet
         
         # Path validation state (for PATH_CHALLENGE/PATH_RESPONSE)
         self._pending_path_challenges: List[dict] = []  # Pending challenges: {data, sent_time, pn}
@@ -1824,6 +1832,101 @@ class RealtimeQUICClient:
             if handshake_pn_used is not None:
                 msgs.append(f"Handshake ACK(PN={handshake_pn_used}, largest={self.handshake_tracker.largest_pn})")
             print(f"    → Sent combined ACK: {' + '.join(msgs)} ({len(combined_packet)} bytes)")
+    
+    def _process_retry_packet(self, packet: bytes) -> bool:
+        """
+        Process a received Retry packet (RFC 9000 Section 17.2.5).
+        
+        When a server receives an Initial packet, it may send a Retry packet
+        to validate the client's address. The client must:
+        1. Validate the Retry Integrity Tag
+        2. Store the Retry Token
+        3. Update DCID to the SCID from Retry packet
+        4. Resend the Initial packet with the Retry Token
+        
+        A client MUST only process one Retry packet per connection attempt.
+        
+        Args:
+            packet: Raw Retry packet bytes
+            
+        Returns:
+            bool: True if Retry was processed successfully
+        """
+        # Only process Retry if we haven't received one before
+        if self._retry_received:
+            if self.debug:
+                print(f"    ⚠️ Ignoring duplicate Retry packet")
+            return False
+        
+        # Parse and validate Retry packet
+        result = parse_retry_packet(packet, self.original_dcid, debug=self.debug)
+        
+        if not result["success"]:
+            if self.debug:
+                print(f"    ❌ Retry packet validation failed: {result['error']}")
+            return False
+        
+        # Mark that we've received a Retry packet
+        self._retry_received = True
+        self._retry_source_cid = result["scid_bytes"]
+        self._retry_token = result["retry_token"]
+        
+        if self.debug:
+            print(f"    ✓ Retry packet processed:")
+            print(f"      New DCID (from Retry SCID): {self._retry_source_cid.hex()}")
+            print(f"      Retry Token: {self._retry_token.hex()[:40]}..." if len(self._retry_token) > 20 else f"      Retry Token: {self._retry_token.hex()}")
+        
+        # Re-derive Initial keys with new DCID (RFC 9001 Section 5.2)
+        # After receiving a Retry, the client uses the Retry packet's SCID 
+        # as the new DCID for deriving Initial keys
+        new_dcid = self._retry_source_cid
+        
+        # Update client's initial secrets with new DCID
+        from quic.crypto.keys import derive_initial_secrets, derive_server_initial_secrets
+        self.client_initial_secrets = derive_initial_secrets(new_dcid)
+        self.server_initial_secrets = derive_server_initial_secrets(new_dcid)
+        
+        if self.debug:
+            print(f"    ✓ Re-derived Initial keys with new DCID")
+        
+        # Build new Initial packet with Retry Token
+        # Reset packet number to 0 for the new Initial packet
+        self.client_initial_pn = 0
+        
+        new_packet = create_initial_packet_with_retry_token(
+            hostname=self.hostname,
+            dcid=new_dcid,
+            scid=self.our_scid,
+            retry_token=self._retry_token,
+            private_key=self.private_key,
+            client_hello=self.client_hello,
+            debug=self.debug
+        )
+        
+        if self.debug:
+            print(f"    → Sending new Initial packet with Retry Token")
+            print(f"      Packet size: {len(new_packet)} bytes")
+        
+        # Clear old sent packet tracking for Initial space since we're starting fresh
+        self.loss_detector.sent_packets[PacketNumberSpace.INITIAL].clear()
+        self.loss_detector.largest_acked[PacketNumberSpace.INITIAL] = -1
+        
+        # Track the new sent packet
+        self._track_sent_packet(
+            PacketNumberSpace.INITIAL,
+            0,  # PN=0 (reset)
+            len(new_packet),
+            frames=[{"type": "CRYPTO", "offset": 0, "data": self.client_hello}]
+        )
+        
+        # Send the new Initial packet
+        self.send(new_packet)
+        self.client_initial_pn += 1
+        
+        if self.debug:
+            print(f"    → Sent Initial packet with Retry Token (PN=0)")
+        
+        return True
     
     def _process_initial_packet(self, packet: bytes, recv_time: float = None) -> bool:
         """Process a received Initial packet."""
@@ -3922,7 +4025,25 @@ class RealtimeQUICClient:
                     return
                 break
             
-            # Parse Long header
+            # Check for Retry packet first (Retry has different structure, no Length field)
+            # Retry packet: packet_type = 3 (bits 4-5 of first byte)
+            first_byte = remaining[0]
+            packet_type_from_header = (first_byte & 0x30) >> 4
+            
+            if packet_type_from_header == 3:  # Retry packet
+                if self.debug:
+                    print(f"    📦 [#{self.packets_received}.{packet_in_datagram}] Retry")
+                # Retry packet consumes all remaining data (no Length field)
+                if self._process_retry_packet(remaining):
+                    # Successfully processed Retry, we've resent Initial
+                    # Don't try to parse more packets from this datagram
+                    break
+                else:
+                    if self.debug:
+                        print(f"      ⚠️ Retry packet processing failed")
+                    break
+            
+            # Parse Long header for non-Retry packets
             header_info = parse_long_header(remaining)
             if not header_info["success"]:
                 if self.debug:

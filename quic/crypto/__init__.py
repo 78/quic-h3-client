@@ -28,5 +28,8 @@ from .aead import (
     decrypt_payload,
     apply_header_protection,
     remove_header_protection,
+    verify_retry_integrity_tag,
+    compute_retry_integrity_tag,
+    build_retry_integrity_tag,
 )
 

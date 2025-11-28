@@ -15,7 +15,8 @@ from ..frames.builders import build_crypto_frame, build_padding_frame
 
 
 def build_initial_packet(dcid: bytes, scid: bytes, packet_number: int, 
-                         payload: bytes, debug: bool = False) -> bytes:
+                         payload: bytes, token: bytes = b"", 
+                         debug: bool = False) -> bytes:
     """
     Build complete QUIC Initial packet with automatic key derivation.
     
@@ -24,6 +25,7 @@ def build_initial_packet(dcid: bytes, scid: bytes, packet_number: int,
         scid: Source Connection ID
         packet_number: Packet number
         payload: Plaintext payload (frames)
+        token: Optional Retry Token from server (for address validation)
         debug: Enable debug output
         
     Returns:
@@ -48,7 +50,9 @@ def build_initial_packet(dcid: bytes, scid: bytes, packet_number: int,
     header += struct.pack(">I", QUIC_VERSION)
     header += struct.pack("B", len(dcid)) + dcid
     header += struct.pack("B", len(scid)) + scid
-    header += encode_varint(0)  # Token length = 0
+    header += encode_varint(len(token))  # Token length
+    if token:
+        header += token  # Include Retry Token
     
     # Calculate length field (packet number + payload + auth tag)
     encrypted_length = pn_length + len(payload) + 16
@@ -62,6 +66,8 @@ def build_initial_packet(dcid: bytes, scid: bytes, packet_number: int,
         print(f"  [DEBUG] Header before encryption ({len(header)} bytes): {header.hex()}")
         print(f"  [DEBUG] Payload length: {len(payload)} bytes")
         print(f"  [DEBUG] PN offset: {pn_offset}")
+        if token:
+            print(f"  [DEBUG] Retry Token ({len(token)} bytes): {token.hex()}")
     
     # Encrypt payload
     encrypted_payload = encrypt_payload(secrets, packet_number, header, payload)
@@ -333,6 +339,77 @@ def build_0rtt_packet(secrets: dict, dcid: bytes, scid: bytes,
     )
     
     return protected_header + encrypted_payload
+
+
+def create_initial_packet_with_retry_token(
+    hostname: str, 
+    dcid: bytes,
+    scid: bytes,
+    retry_token: bytes,
+    private_key: X25519PrivateKey,
+    client_hello: bytes,
+    debug: bool = False
+) -> bytes:
+    """
+    Create a new QUIC Initial packet with a Retry Token.
+    
+    This is sent in response to a server's Retry packet for address validation.
+    The packet uses the same keys (SCID from client), same ClientHello,
+    but with a new DCID (from Retry packet's SCID) and includes the Retry Token.
+    
+    Args:
+        hostname: Target hostname
+        dcid: New Destination Connection ID (from Retry packet's SCID)
+        scid: Our Source Connection ID (same as before)
+        retry_token: The Retry Token from the server's Retry packet
+        private_key: Our X25519 private key (same as before)
+        client_hello: Original ClientHello message
+        debug: Enable debug output
+        
+    Returns:
+        bytes: Complete encrypted Initial packet with Retry Token
+    """
+    # Build CRYPTO frame with original ClientHello
+    crypto_frame = build_crypto_frame(0, client_hello)
+    
+    if debug:
+        print(f"  [DEBUG] CRYPTO frame length: {len(crypto_frame)} bytes")
+        print(f"  [DEBUG] Retry Token length: {len(retry_token)} bytes")
+    
+    # Calculate exact header size for padding
+    # Token field now includes the retry token length
+    token_len_size = len(encode_varint(len(retry_token)))
+    header_base_size = 1 + 4 + 1 + len(dcid) + 1 + len(scid) + token_len_size + len(retry_token)
+    auth_tag_size = 16
+    pn_length = 2
+    min_packet_size = 1200
+    length_field_size = 2
+    
+    # Available space for payload
+    available_for_payload = min_packet_size - header_base_size - length_field_size - pn_length - auth_tag_size
+    
+    padding_needed = available_for_payload - len(crypto_frame)
+    if padding_needed > 0:
+        crypto_frame += build_padding_frame(padding_needed)
+    
+    if debug:
+        print(f"  [DEBUG] Total payload (with padding): {len(crypto_frame)} bytes")
+    
+    # Build Initial packet with Retry Token, starting with packet number 0
+    packet = build_initial_packet(dcid, scid, 0, crypto_frame, token=retry_token, debug=debug)
+
+    if debug:
+        print(f"  [DEBUG] Initial packet with Retry Token length: {len(packet)} bytes")
+    
+    # Ensure packet is at least 1200 bytes
+    if len(packet) < 1200:
+        extra_padding = 1200 - len(packet)
+        if debug:
+            print(f"  [DEBUG] Adding extra padding: {extra_padding} bytes")
+        crypto_frame += build_padding_frame(extra_padding)
+        packet = build_initial_packet(dcid, scid, 0, crypto_frame, token=retry_token, debug=debug)
+    
+    return packet
 
 
 def create_initial_packet_with_psk(hostname: str, session_ticket, debug: bool = False) -> tuple:

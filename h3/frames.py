@@ -175,7 +175,7 @@ def build_h3_max_push_id_frame(push_id: int) -> bytes:
     return frame
 
 
-def build_h3_control_stream_data(settings: dict, max_push_id: int = 8) -> bytes:
+def build_h3_control_stream_data(settings: dict, max_push_id: int = 0) -> bytes:
     """
     Build complete HTTP/3 control stream data.
     
@@ -186,7 +186,8 @@ def build_h3_control_stream_data(settings: dict, max_push_id: int = 8) -> bytes:
     
     Args:
         settings: HTTP/3 settings to send
-        max_push_id: Maximum push ID (default 8)
+        max_push_id: Maximum push ID (default 0 to disable server push)
+                     Server push is deprecated in practice, though still in RFC 9114
         
     Returns:
         bytes: Complete control stream initialization data
