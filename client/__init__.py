@@ -32,7 +32,7 @@ from .loss_detection import (
 
 # Component classes
 from .crypto_manager import CryptoManager, CryptoState
-from .flow_controller import FlowController, StreamFlowState
+from .flow_controller import FlowController
 from .ack_manager import AckManager, PacketTracker
 from .h3_handler import H3Handler, H3Settings, H3Response
 from .frame_processor import FrameProcessor
@@ -53,7 +53,6 @@ __all__ = [
     "CryptoManager",
     "CryptoState",
     "FlowController",
-    "StreamFlowState",
     "AckManager",
     "H3Handler",
     "H3Settings",

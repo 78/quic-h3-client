@@ -12,8 +12,9 @@ Implements:
 import time
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Callable, Any
-from collections import OrderedDict
+from typing import Dict, List, Optional, Callable, Any
+
+from quic.constants import TRANSPORT_MAX_ACK_DELAY_MS
 
 
 # =============================================================================
@@ -265,15 +266,19 @@ class RTTEstimate:
     # First RTT sample (used for special handling)
     first_rtt_sample: Optional[float] = None
     
-    def update(self, rtt_sample: float, ack_delay: float = 0.0, max_ack_delay: float = 0.025):
+    def update(self, rtt_sample: float, ack_delay: float = 0.0, max_ack_delay: float = None):
         """
         Update RTT estimates based on a new sample.
         
         Args:
             rtt_sample: The measured RTT
             ack_delay: ACK delay reported by peer (in seconds)
-            max_ack_delay: Maximum ACK delay (from transport parameters)
+            max_ack_delay: Maximum ACK delay (from transport parameters, in seconds)
+                          If None, uses default from TRANSPORT_MAX_ACK_DELAY_MS
         """
+        if max_ack_delay is None:
+            max_ack_delay = TRANSPORT_MAX_ACK_DELAY_MS / 1000.0
+        
         self.latest_rtt = rtt_sample
         
         # Update min_rtt (RFC 9002 Section 5.2)
@@ -298,18 +303,21 @@ class RTTEstimate:
             # smoothed_rtt = 7/8 * smoothed_rtt + 1/8 * adjusted_rtt
             self.smoothed_rtt = 0.875 * self.smoothed_rtt + 0.125 * adjusted_rtt
     
-    def get_pto(self, max_ack_delay: float = 0.025) -> float:
+    def get_pto(self, max_ack_delay: float = None) -> float:
         """
         Calculate Probe Timeout (PTO).
         
         PTO = smoothed_rtt + max(4*rttvar, kGranularity) + max_ack_delay
         
         Args:
-            max_ack_delay: Maximum ACK delay (from transport parameters)
+            max_ack_delay: Maximum ACK delay (from transport parameters, in seconds)
+                          If None, uses default from TRANSPORT_MAX_ACK_DELAY_MS
             
         Returns:
             float: PTO in seconds
         """
+        if max_ack_delay is None:
+            max_ack_delay = TRANSPORT_MAX_ACK_DELAY_MS / 1000.0
         kGranularity = 0.001  # 1ms timer granularity
         return self.smoothed_rtt + max(4 * self.rttvar, kGranularity) + max_ack_delay
 
@@ -366,7 +374,7 @@ class LossDetector:
         
         # PTO state
         self.pto_count: int = 0
-        self.max_ack_delay: float = 0.025  # Default 25ms, can be updated from transport params
+        self.max_ack_delay: float = TRANSPORT_MAX_ACK_DELAY_MS / 1000.0  # Convert ms to seconds, can be updated from transport params
         
         # Callbacks for retransmission
         self.on_packets_lost: Optional[Callable[[PacketNumberSpace, List[SentPacketInfo]], None]] = None

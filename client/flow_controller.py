@@ -9,22 +9,14 @@ Handles:
 """
 
 from typing import Dict, Optional, Tuple, Callable
-from dataclasses import dataclass, field
 
 from quic.varint import encode_varint
-
-
-@dataclass
-class StreamFlowState:
-    """Flow control state for a single stream."""
-    # Receive side (tracking what peer sends us)
-    bytes_received: int = 0
-    max_data_sent: int = 0  # Last MAX_STREAM_DATA value sent to peer
-    
-    # Send side (respecting peer's limits)
-    bytes_sent: int = 0
-    peer_max_data: int = 0  # Limit from peer (updated via MAX_STREAM_DATA)
-    blocked_at: Optional[int] = None  # Limit we reported blocked at
+from quic.constants import (
+    TRANSPORT_INITIAL_MAX_DATA,
+    TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+    TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+    TRANSPORT_INITIAL_MAX_STREAM_DATA_UNI,
+)
 
 
 class FlowController:
@@ -48,8 +40,8 @@ class FlowController:
         
         # Initial values from our transport parameters
         # For embedded devices (2Mbps): BDP = 2Mbps × 200ms = 50KB, use 2×BDP = ~64KB
-        self._initial_max_data: int = 65536  # 64KB
-        self._initial_max_stream_data: int = 65536  # 64KB
+        self._initial_max_data: int = TRANSPORT_INITIAL_MAX_DATA
+        self._initial_max_stream_data: int = TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE
         
         # Connection level - receive side
         self._max_data_sent: int = self._initial_max_data  # Last MAX_DATA sent
@@ -67,13 +59,13 @@ class FlowController:
         # =================================================================
         
         # Connection level - send side (set by server's transport params)
-        self._peer_max_data: int = 65536  # Updated from EncryptedExtensions
+        self._peer_max_data: int = TRANSPORT_INITIAL_MAX_DATA  # Updated from EncryptedExtensions
         self._data_sent: int = 0  # Total bytes we've sent
         
         # Initial stream limits from peer's transport params
-        self._peer_max_stream_data_bidi_local: int = 65536  # Server-initiated bidi
-        self._peer_max_stream_data_bidi_remote: int = 65536  # Client-initiated bidi
-        self._peer_max_stream_data_uni: int = 65536  # Unidirectional
+        self._peer_max_stream_data_bidi_local: int = TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL  # Server-initiated bidi
+        self._peer_max_stream_data_bidi_remote: int = TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE  # Client-initiated bidi
+        self._peer_max_stream_data_uni: int = TRANSPORT_INITIAL_MAX_STREAM_DATA_UNI  # Unidirectional
         
         # Per-stream - send side
         self._stream_sent: Dict[int, int] = {}  # stream_id -> bytes sent

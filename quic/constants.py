@@ -90,3 +90,29 @@ TRANSPORT_PARAM_BINARY = {0x00, 0x02, 0x0f, 0x10}
 # Flag transport parameters (presence means True)
 TRANSPORT_PARAM_FLAGS = {0x0c}
 
+# =============================================================================
+# Default Transport Parameter Values (RFC 9000)
+# =============================================================================
+# These are the default values we advertise to the server and use internally.
+# For embedded devices (2Mbps): BDP = 2Mbps × 200ms = 50KB, use 2×BDP = ~64KB
+
+# Connection-level flow control
+TRANSPORT_MAX_IDLE_TIMEOUT_MS = 60000  # 60 seconds
+TRANSPORT_INITIAL_MAX_DATA = 65536  # 64KB
+
+# Stream-level flow control (all stream types)
+TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL = 65536  # 64KB
+TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE = 65536  # 64KB
+TRANSPORT_INITIAL_MAX_STREAM_DATA_UNI = 65536  # 64KB
+
+# Stream limits (reduced for embedded devices)
+TRANSPORT_INITIAL_MAX_STREAMS_BIDI = 8
+TRANSPORT_INITIAL_MAX_STREAMS_UNI = 8
+
+# ACK timing
+TRANSPORT_ACK_DELAY_EXPONENT = 3
+TRANSPORT_MAX_ACK_DELAY_MS = 25  # 25 milliseconds
+
+# Connection ID management
+TRANSPORT_ACTIVE_CONNECTION_ID_LIMIT = 2  # Minimal for embedded devices
+

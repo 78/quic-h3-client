@@ -8,7 +8,7 @@ Handles:
 """
 
 import time
-from typing import Dict, Optional, List, Tuple, Callable, Set
+from typing import Optional, List, Tuple, Callable, Set
 from dataclasses import dataclass, field
 
 from quic.frames import build_ack_frame

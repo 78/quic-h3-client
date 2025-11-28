@@ -10,7 +10,7 @@ Handles all cryptographic operations:
 
 import hashlib
 from typing import Optional, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -19,9 +19,8 @@ from quic.crypto import (
     derive_initial_secrets, derive_server_initial_secrets,
     derive_handshake_secrets, derive_application_secrets,
     build_client_finished_message, perform_ecdh,
-    remove_header_protection, decrypt_payload, encrypt_payload,
-    apply_header_protection,
-    derive_resumption_master_secret, derive_0rtt_secrets,
+    remove_header_protection, decrypt_payload,
+    derive_resumption_master_secret,
     derive_0rtt_application_secrets, derive_handshake_secrets_with_psk,
     derive_next_application_secrets,
 )

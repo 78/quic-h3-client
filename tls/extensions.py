@@ -5,8 +5,20 @@ TLS 1.3 Extension Building and Parsing (RFC 8446)
 import struct
 import hmac
 import hashlib
-from quic.varint import encode_varint, decode_varint
+from quic.varint import encode_varint
 from quic.frames.parsers import parse_quic_transport_params
+from quic.constants import (
+    TRANSPORT_MAX_IDLE_TIMEOUT_MS,
+    TRANSPORT_INITIAL_MAX_DATA,
+    TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+    TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+    TRANSPORT_INITIAL_MAX_STREAM_DATA_UNI,
+    TRANSPORT_INITIAL_MAX_STREAMS_BIDI,
+    TRANSPORT_INITIAL_MAX_STREAMS_UNI,
+    TRANSPORT_ACK_DELAY_EXPONENT,
+    TRANSPORT_MAX_ACK_DELAY_MS,
+    TRANSPORT_ACTIVE_CONNECTION_ID_LIMIT,
+)
 from .constants import (
     EXT_SERVER_NAME, EXT_SUPPORTED_GROUPS, EXT_SIGNATURE_ALGORITHMS,
     EXT_ALPN, EXT_SUPPORTED_VERSIONS, EXT_KEY_SHARE, EXT_QUIC_TRANSPORT_PARAMS,
@@ -112,60 +124,60 @@ def build_quic_transport_params(scid: bytes, max_datagram_frame_size: int = 0) -
     """
     params = b""
     
-    # max_idle_timeout (0x01): 60000 ms
+    # max_idle_timeout (0x01)
     params += encode_varint(0x01)  # type
     params += encode_varint(4)      # length
-    params += encode_varint(60000)  # value
+    params += encode_varint(TRANSPORT_MAX_IDLE_TIMEOUT_MS)  # value
     
-    # initial_max_data (0x04): 65536 (64KB - for 2Mbps embedded devices)
+    # initial_max_data (0x04)
     # Formula: 2 × BDP, where BDP = bandwidth × RTT
     # 2Mbps × 200ms = 50KB, so 64KB provides good headroom
     params += encode_varint(0x04)
     params += encode_varint(4)
-    params += encode_varint(65536)
+    params += encode_varint(TRANSPORT_INITIAL_MAX_DATA)
     
-    # initial_max_stream_data_bidi_local (0x05): 65536 (64KB)
+    # initial_max_stream_data_bidi_local (0x05)
     params += encode_varint(0x05)
     params += encode_varint(4)
-    params += encode_varint(65536)
+    params += encode_varint(TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL)
     
-    # initial_max_stream_data_bidi_remote (0x06): 65536 (64KB)
+    # initial_max_stream_data_bidi_remote (0x06)
     params += encode_varint(0x06)
     params += encode_varint(4)
-    params += encode_varint(65536)
+    params += encode_varint(TRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE)
     
-    # initial_max_stream_data_uni (0x07): 65536 (64KB)
+    # initial_max_stream_data_uni (0x07)
     params += encode_varint(0x07)
     params += encode_varint(4)
-    params += encode_varint(65536)
+    params += encode_varint(TRANSPORT_INITIAL_MAX_STREAM_DATA_UNI)
     
-    # initial_max_streams_bidi (0x08): 8 (reduced for embedded devices)
-    # Each stream needs state tracking, fewer streams = less memory
+    # initial_max_streams_bidi (0x08)
+    # Reduced for embedded devices - each stream needs state tracking
     params += encode_varint(0x08)
     params += encode_varint(1)
-    params += encode_varint(8)
+    params += encode_varint(TRANSPORT_INITIAL_MAX_STREAMS_BIDI)
     
-    # initial_max_streams_uni (0x09): 8 (reduced for embedded devices)
+    # initial_max_streams_uni (0x09)
     # HTTP/3 needs 3 uni streams (control, QPACK encoder/decoder)
     params += encode_varint(0x09)
     params += encode_varint(1)
-    params += encode_varint(8)
+    params += encode_varint(TRANSPORT_INITIAL_MAX_STREAMS_UNI)
     
-    # ack_delay_exponent (0x0a): 3
+    # ack_delay_exponent (0x0a)
     params += encode_varint(0x0a)
     params += encode_varint(1)
-    params += encode_varint(3)
+    params += encode_varint(TRANSPORT_ACK_DELAY_EXPONENT)
     
-    # max_ack_delay (0x0b): 25ms
+    # max_ack_delay (0x0b)
     params += encode_varint(0x0b)
     params += encode_varint(1)
-    params += encode_varint(25)
+    params += encode_varint(TRANSPORT_MAX_ACK_DELAY_MS)
     
-    # active_connection_id_limit (0x0e): 2 (minimal for embedded devices)
+    # active_connection_id_limit (0x0e)
     # Fewer CIDs = less memory for tracking
     params += encode_varint(0x0e)
     params += encode_varint(1)
-    params += encode_varint(2)
+    params += encode_varint(TRANSPORT_ACTIVE_CONNECTION_ID_LIMIT)
     
     # initial_source_connection_id (0x0f)
     params += encode_varint(0x0f)
