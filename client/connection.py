@@ -2107,8 +2107,25 @@ class RealtimeQUICClient:
             packet_in_datagram += 1
             first_byte = remaining[0]
             
-            # Short header (1-RTT)
+            # Short header (1-RTT) detection
+            # Short Header format: 0_1_S_RR_PP (first bit = 0, second bit = 1, i.e. 0x40-0x7F)
+            # If first_byte < 0x40, it's likely padding (0x00) or garbage data, not a real Short Header
             if not (first_byte & 0x80):
+                # Validate Short Header format: Fixed Bit must be 1 (RFC 9000 Section 17.3)
+                if not (first_byte & 0x40):
+                    # Not a valid Short Header (could be padding or other data)
+                    if self.debug and first_byte != 0x00:  # Don't spam for PADDING
+                        print(f"      ⚠️ Invalid Short Header first byte: 0x{first_byte:02x}, skipping remaining {len(remaining)} bytes")
+                    break
+                
+                # Check minimum packet size (DCID + PN + Auth Tag at minimum)
+                dcid_len = len(self.our_scid) if self.our_scid else 8
+                min_short_header_size = 1 + dcid_len + 1 + 16  # header + DCID + min PN + auth tag
+                if len(remaining) < min_short_header_size:
+                    if self.debug:
+                        print(f"      ⚠️ Remaining data too short for Short Header: {len(remaining)} bytes")
+                    break
+                
                 if self.debug:
                     print(f"    📦 [#{self.packets_received}.{packet_in_datagram}] Short Header (1-RTT)")
                 self._process_1rtt_packet(remaining, recv_time)
