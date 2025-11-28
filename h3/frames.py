@@ -523,6 +523,33 @@ def build_h3_data_frame(data: bytes) -> bytes:
     return frame
 
 
+def build_h3_goaway_frame(stream_id: int) -> bytes:
+    """
+    Build HTTP/3 GOAWAY frame (RFC 9114 Section 5.2).
+    
+    Frame Type: 0x07
+    
+    The GOAWAY frame is used to initiate graceful shutdown of a connection.
+    The stream ID identifies the last client-initiated bidirectional stream
+    that was or might be processed by the server.
+    
+    For a client sending GOAWAY, the stream ID indicates the largest
+    push ID that was or might be processed. Since push is rarely used,
+    this is typically 0.
+    
+    Args:
+        stream_id: Stream ID (for client: last push ID, for server: last request stream ID)
+        
+    Returns:
+        bytes: Complete GOAWAY frame
+    """
+    payload = encode_varint(stream_id)
+    frame = encode_varint(0x07)  # GOAWAY frame type
+    frame += encode_varint(len(payload))
+    frame += payload
+    return frame
+
+
 def parse_h3_frames(data: bytes, debug: bool = False) -> list:
     """
     Parse HTTP/3 frames from stream data.

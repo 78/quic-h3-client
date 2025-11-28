@@ -50,8 +50,17 @@
   - X25519 密钥交换
   - 证书验证
 - ✅ **0-RTT 会话恢复**: Session Ticket 支持，加速后续连接
+- ✅ **Key Update**: RFC 9001 Section 6，支持 1-RTT 密钥轮换
+  - 主动发起密钥更新（`initiate_key_update()`）
+  - 处理对端发起的密钥更新
+  - Key Phase bit 正确设置和检测
+  - 过渡期密钥管理（支持新旧密钥并存）
 - ✅ **优雅关闭**: CONNECTION_CLOSE 帧处理
 - ✅ **Stateless Reset**: 检测和处理无状态重置包
+- ✅ **Connection ID 管理**: 
+  - NEW_CONNECTION_ID 帧发送和接收
+  - RETIRE_CONNECTION_ID 帧处理（自动和手动）
+  - 根据 `retire_prior_to` 自动退休旧连接 ID
 
 #### 流控制
 - ✅ **连接级流控**: MAX_DATA 帧
@@ -87,6 +96,7 @@
 - ✅ MAX_STREAMS_BIDI (0x12)
 - ✅ MAX_STREAMS_UNI (0x13)
 - ✅ NEW_CONNECTION_ID (0x18)
+- ✅ RETIRE_CONNECTION_ID (0x19)
 - ✅ CONNECTION_CLOSE (0x1c)
 - ✅ CONNECTION_CLOSE_APP (0x1d)
 - ✅ HANDSHAKE_DONE (0x1e)
@@ -110,11 +120,13 @@
 - ✅ **HEADERS (0x01)**: 请求/响应头
 - ✅ **DATA (0x00)**: 请求/响应体
 - ✅ **SETTINGS (0x04)**: 协议设置
+- ✅ **GOAWAY (0x07)**: 优雅关闭流程（RFC 9114 Section 5.2）
 - ✅ **MAX_PUSH_ID (0x0d)**: 推送 ID 限制
 
 #### 功能特性
 - ✅ **并发请求**: 单连接多流并发
 - ✅ **流重组**: 处理乱序到达的数据
+- ✅ **优雅关闭**: GOAWAY 帧支持，完整的 graceful shutdown API
 - ✅ **Wireshark 支持**: SSLKEYLOGFILE 格式密钥日志
 
 ---
@@ -143,21 +155,9 @@
 
 **影响**: 无法在网络切换时保持连接
 
-#### 🟡 Key Update
-- ❌ **1-RTT 密钥轮换**: RFC 9001 Section 6
-- ❌ **密钥更新触发**: 基于时间或数据量
-
-**影响**: 长连接安全性降低（密钥固定不变）
-
 ---
 
 ### 低优先级（可选实现）
-
-#### 🟢 Connection ID 管理
-- ❌ **RETIRE_CONNECTION_ID (0x19)**: 回收旧 Connection ID
-- ❌ **Connection ID 轮换**: 主动轮换机制
-
-**当前状态**: 只发送 NEW_CONNECTION_ID，不回收旧 ID
 
 #### 🟢 Server Push
 - ❌ **PUSH_PROMISE (0x05)**: 推送承诺帧处理
@@ -167,11 +167,6 @@
 
 **影响**: 无法接收服务器推送资源
 
-#### 🟢 GOAWAY 处理
-- ❌ **GOAWAY (0x07)**: 优雅关闭流程
-- ❌ **流 ID 限制**: 停止接受新流
-
-**当前状态**: 只解析帧，无后续处理
 
 #### 🟢 QPACK 动态表编码
 - ❌ **客户端动态表**: 使用动态表压缩请求头
@@ -254,7 +249,8 @@ async def main():
     print(f"Status: {response['status']}")
     print(f"Body: {response['body']}")
     
-    await client.close()
+    # 优雅关闭连接
+    await client.graceful_shutdown()
 
 asyncio.run(main())
 ```
@@ -333,6 +329,22 @@ http3-client/
 ## 📝 更新日志
 
 ### 最新更新
+- ✅ 实现 GOAWAY（RFC 9114 Section 5.2）
+  - 支持发送和接收 GOAWAY 帧
+  - 实现 `send_goaway()` 方法发送 GOAWAY 帧
+  - 实现 `graceful_shutdown()` 方法进行完整的优雅关闭流程
+  - 收到 GOAWAY 后正确处理流 ID 限制
+  - 支持等待待处理请求完成后再关闭连接
+- ✅ 实现 RETIRE_CONNECTION_ID（RFC 9000 Section 19.16）
+  - 支持发送和接收 RETIRE_CONNECTION_ID 帧
+  - 根据 NEW_CONNECTION_ID 的 `retire_prior_to` 自动退休旧连接 ID
+  - 正确处理对端发起的连接 ID 退休请求
+  - 添加测试函数 `test_retire_connection_id()` 和 `--test-retire-cid` 参数
+- ✅ 实现 Key Update（RFC 9001 Section 6）
+  - 支持主动发起 1-RTT 密钥轮换
+  - 支持处理对端发起的密钥更新
+  - Key Phase bit 正确设置和检测
+  - 过渡期密钥管理，确保数据包正确解密
 - ✅ 实现拥塞控制（Slow Start + Congestion Avoidance + AIMD）
 - ✅ 实现 Stateless Reset 检测和处理
 - ✅ 完善 QPACK 动态表解码

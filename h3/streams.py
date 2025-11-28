@@ -63,6 +63,10 @@ class H3StreamManager:
         # Request stream responses
         self.responses = {}  # stream_id -> {"headers": [], "data": bytes, "complete": bool}
     
+        # GOAWAY state - graceful shutdown handling (RFC 9114 Section 5.2)
+        self.goaway_received = False
+        self.goaway_stream_id = None  # Last stream ID from peer's GOAWAY
+    
     def set_debug(self, debug: bool):
         """Enable/disable debug output for QPACK table."""
         self.qpack_dynamic_table.set_debug(debug)
@@ -223,10 +227,22 @@ class H3StreamManager:
                 frames = parse_h3_frames(frame_data, debug)
                 results.extend(frames)
                 
-                # Update settings from SETTINGS frames
+                # Process specific frame types
                 for frame in frames:
                     if frame.get("frame_type") == "SETTINGS":
+                        # Update settings from SETTINGS frames
                         self.peer_settings.update(frame.get("settings", {}))
+                    elif frame.get("frame_type") == "GOAWAY":
+                        # Handle GOAWAY frame - graceful shutdown initiated by peer
+                        goaway_stream_id = frame.get("stream_id", 0)
+                        self.goaway_received = True
+                        self.goaway_stream_id = goaway_stream_id
+                        if debug:
+                            print(f"          🚪 Received GOAWAY: last_stream_id={goaway_stream_id}")
+                        results.append({
+                            "type": "goaway_received",
+                            "stream_id": goaway_stream_id,
+                        })
         
         # Process QPACK encoder stream - this is critical for dynamic table
         elif stream["type"] == H3_STREAM_TYPE_QPACK_ENCODER:

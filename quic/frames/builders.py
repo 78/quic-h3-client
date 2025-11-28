@@ -210,6 +210,26 @@ def build_max_stream_data_frame(stream_id: int, max_stream_data: int) -> bytes:
     return frame
 
 
+def build_retire_connection_id_frame(sequence: int) -> bytes:
+    """
+    Build QUIC RETIRE_CONNECTION_ID frame.
+    
+    Frame Type: 0x19
+    
+    This frame is used to indicate that the endpoint will no longer use
+    a connection ID that was issued by its peer.
+    
+    Args:
+        sequence: The sequence number of the connection ID being retired
+        
+    Returns:
+        bytes: Complete RETIRE_CONNECTION_ID frame
+    """
+    frame = encode_varint(0x19)  # Frame type: RETIRE_CONNECTION_ID
+    frame += encode_varint(sequence)
+    return frame
+
+
 def build_connection_close_frame(error_code: int = 0, frame_type: int = None, 
                                   reason: str = "", is_application: bool = False) -> bytes:
     """

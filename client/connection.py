@@ -28,8 +28,8 @@ from quic.crypto import (
 from quic.frames import (
     build_crypto_frame, build_ack_frame, build_padding_frame,
     build_stream_frame, build_new_connection_id_frame,
-    build_connection_close_frame, parse_quic_frames,
-    build_max_data_frame, build_max_stream_data_frame,
+    build_retire_connection_id_frame, build_connection_close_frame,
+    parse_quic_frames, build_max_data_frame, build_max_stream_data_frame,
 )
 from quic.packets import (
     build_initial_packet_with_secrets, build_handshake_packet,
@@ -41,7 +41,7 @@ from tls.session import SessionTicket, SessionTicketStore
 from h3.frames import (
     build_h3_control_stream_data, build_h3_qpack_encoder_stream_data,
     build_h3_qpack_decoder_stream_data, build_qpack_request_headers,
-    build_h3_headers_frame, build_h3_data_frame,
+    build_h3_headers_frame, build_h3_data_frame, build_h3_goaway_frame,
 )
 from h3.streams import H3StreamManager, describe_stream_id
 from utils.keylog import write_keylog
@@ -160,12 +160,23 @@ class RealtimeQUICClient:
         }
         self.h3_max_push_id = 8
         
+        # GOAWAY state - graceful connection shutdown (RFC 9114 Section 5.2)
+        self.goaway_received = False      # True if peer sent GOAWAY
+        self.goaway_sent = False          # True if we sent GOAWAY
+        self.goaway_last_stream_id = None # Last stream ID from peer's GOAWAY
+        
         # Alternative connection IDs
         self.alt_connection_ids = []
         
         # Server's stateless reset tokens (for detecting Stateless Reset packets)
         # Maps: stateless_reset_token (bytes) -> connection_id (bytes)
         self.peer_stateless_reset_tokens: dict[bytes, bytes] = {}
+        
+        # Peer's connection IDs (received via NEW_CONNECTION_ID frames)
+        # Maps: sequence_number (int) -> {cid: bytes, reset_token: bytes, retired: bool}
+        self.peer_connection_ids: Dict[int, dict] = {}
+        # Track the highest retire_prior_to value we've seen
+        self._peer_retire_prior_to: int = 0
         
         # Session tickets for 0-RTT
         self.session_tickets = []
@@ -293,6 +304,133 @@ class RealtimeQUICClient:
             self._pto_timer_task.cancel()
         if self.transport:
             self.transport.close()
+    
+    async def send_goaway(self, last_stream_id: int = None) -> bool:
+        """
+        Send HTTP/3 GOAWAY frame for graceful shutdown (RFC 9114 Section 5.2).
+        
+        The GOAWAY frame indicates that the endpoint will not initiate new streams
+        and will not accept new requests. Existing streams can still complete.
+        
+        For a client, the stream_id typically indicates the largest push ID that
+        was or might be processed (usually 0 since server push is rarely used).
+        
+        Args:
+            last_stream_id: The last stream ID to include in GOAWAY.
+                           For client: typically 0 (no server push expected)
+                           If None, defaults to 0
+        
+        Returns:
+            bool: True if GOAWAY was sent successfully, False otherwise
+        """
+        if not self.application_secrets:
+            if self.debug:
+                print("    ⚠️ Cannot send GOAWAY: no application secrets")
+            return False
+        
+        if self.goaway_sent:
+            if self.debug:
+                print("    ⚠️ GOAWAY already sent")
+            return False
+        
+        # Default stream ID for client is 0 (no server push)
+        if last_stream_id is None:
+            last_stream_id = 0
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        
+        # Build GOAWAY frame
+        goaway_frame = build_h3_goaway_frame(last_stream_id)
+        
+        # Send on the control stream
+        # Need to track the offset for the control stream
+        # For now, we'll append to the existing control stream data
+        control_stream_offset = getattr(self, '_h3_control_stream_offset', 0)
+        if control_stream_offset == 0:
+            # First time sending on control stream after init
+            # The init data was already sent, so we need to calculate the offset
+            from h3.frames import build_h3_control_stream_data
+            init_data = build_h3_control_stream_data(self.h3_settings, self.h3_max_push_id)
+            control_stream_offset = len(init_data)
+        
+        # Build STREAM frame for control stream
+        stream_frame = build_stream_frame(
+            stream_id=self.h3_local_control_stream_id,
+            data=goaway_frame,
+            offset=control_stream_offset,
+            fin=False  # Control stream should not have FIN
+        )
+        
+        # Update the control stream offset
+        self._h3_control_stream_offset = control_stream_offset + len(goaway_frame)
+        
+        # Build and send 1-RTT packet
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, stream_frame)
+        pn = self.client_app_pn
+        self.client_app_pn += 1
+        
+        self.send(packet)
+        self.goaway_sent = True
+        
+        if self.debug:
+            print(f"    🚪 Sent GOAWAY: last_stream_id={last_stream_id}")
+        
+        return True
+    
+    async def graceful_shutdown(self, timeout: float = 5.0) -> bool:
+        """
+        Perform graceful shutdown of the HTTP/3 connection.
+        
+        1. Send GOAWAY frame to indicate no new streams will be accepted
+        2. Wait for pending requests to complete (up to timeout)
+        3. Send CONNECTION_CLOSE frame
+        
+        Args:
+            timeout: Maximum time to wait for pending requests (default 5 seconds)
+        
+        Returns:
+            bool: True if shutdown completed cleanly, False otherwise
+        """
+        if self.debug:
+            print(f"\n    🔄 Starting graceful shutdown...")
+        
+        # Step 1: Send GOAWAY
+        if not self.goaway_sent:
+            await self.send_goaway()
+        
+        # Step 2: Wait for pending requests with timeout
+        pending_streams = [
+            stream_id for stream_id, response in self.h3_manager.responses.items()
+            if not response.get("complete", False)
+        ]
+        
+        if pending_streams:
+            if self.debug:
+                print(f"    ⏳ Waiting for {len(pending_streams)} pending streams: {pending_streams}")
+            
+            try:
+                # Wait for all pending response events
+                wait_tasks = []
+                for stream_id in pending_streams:
+                    if stream_id in self.response_events:
+                        wait_tasks.append(self.response_events[stream_id].wait())
+                
+                if wait_tasks:
+                    await asyncio.wait_for(
+                        asyncio.gather(*wait_tasks, return_exceptions=True),
+                        timeout=timeout
+                    )
+            except asyncio.TimeoutError:
+                if self.debug:
+                    print(f"    ⚠️ Timeout waiting for pending streams")
+        
+        # Step 3: Send CONNECTION_CLOSE
+        if self.debug:
+            print(f"    🔒 Sending CONNECTION_CLOSE...")
+        
+        self.send_connection_close(error_code=0, reason="graceful shutdown")
+        
+        return True
     
     def _start_pto_timer(self):
         """Start or restart the PTO timer."""
@@ -852,6 +990,60 @@ class RealtimeQUICClient:
                             print(f"    ✅ Client Finished acknowledged - handshake confirmed!")
                         self._discard_handshake_keys()
                         break
+    
+    def _retire_connection_ids_prior_to(self, retire_prior_to: int):
+        """
+        Retire connection IDs with sequence number < retire_prior_to.
+        
+        Called when we receive a NEW_CONNECTION_ID frame with retire_prior_to set.
+        Sends RETIRE_CONNECTION_ID frames for each retired ID.
+        
+        Args:
+            retire_prior_to: Sequence numbers < this value should be retired
+        """
+        retired_seqs = []
+        for seq_num, info in self.peer_connection_ids.items():
+            if seq_num < retire_prior_to and not info.get('retired', False):
+                retired_seqs.append(seq_num)
+                info['retired'] = True
+        
+        # Send RETIRE_CONNECTION_ID frames for each retired ID
+        for seq_num in retired_seqs:
+            self.send_retire_connection_id(seq_num)
+    
+    def send_retire_connection_id(self, sequence: int):
+        """
+        Send RETIRE_CONNECTION_ID frame to notify peer that we're retiring a connection ID.
+        
+        Args:
+            sequence: The sequence number of the connection ID to retire
+        """
+        if not self.application_secrets:
+            if self.debug:
+                print(f"    ⚠️ Cannot send RETIRE_CONNECTION_ID: no application secrets")
+            return
+        
+        # Build RETIRE_CONNECTION_ID frame
+        retire_frame = build_retire_connection_id_frame(sequence)
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        
+        # Build and send the 1-RTT packet with RETIRE_CONNECTION_ID
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, retire_frame)
+        pn = self.client_app_pn
+        self.client_app_pn += 1
+        
+        self.send(packet)
+        if self.debug:
+            print(f"    📤 Sent RETIRE_CONNECTION_ID: seq={sequence} (pn={pn})")
+        
+        # Mark as retired in our tracking
+        if sequence in self.peer_connection_ids:
+            self.peer_connection_ids[sequence]['retired'] = True
+            # Remove from stateless reset token tracking
+            token = self.peer_connection_ids[sequence].get('reset_token')
+            if token and token in self.peer_stateless_reset_tokens:
+                del self.peer_stateless_reset_tokens[token]
     
     def send_connection_close(self, error_code: int = 0, reason: str = "", 
                                is_application: bool = True):
@@ -2108,7 +2300,7 @@ class RealtimeQUICClient:
                     self._pto_timer_task.cancel()
                     if self.debug:
                         print(f"        🛑 PTO timer cancelled")
-            elif frame_type == 0x18 or frame_type == 0x19:  # NEW_CONNECTION_ID
+            elif frame_type == 0x18:  # NEW_CONNECTION_ID
                 ack_eliciting = True
                 seq_num, consumed = decode_varint(payload, offset)
                 offset += consumed
@@ -2120,10 +2312,31 @@ class RealtimeQUICClient:
                 offset += cid_len
                 stateless_reset_token = payload[offset:offset + 16]
                 offset += 16
+                
+                # Store the connection ID info
+                self.peer_connection_ids[seq_num] = {
+                    'cid': cid,
+                    'reset_token': stateless_reset_token,
+                    'retired': False
+                }
                 # Store server's stateless reset token for detecting Stateless Reset packets
                 self.peer_stateless_reset_tokens[stateless_reset_token] = cid
+                
                 if self.debug:
-                    print(f"        NEW_CONNECTION_ID: seq={seq_num}, cid={cid.hex()[:16]}..., reset_token={stateless_reset_token.hex()[:16]}...")
+                    print(f"        NEW_CONNECTION_ID: seq={seq_num}, retire_prior_to={retire_prior}, cid={cid.hex()[:16]}...")
+                
+                # Retire connection IDs with sequence < retire_prior_to
+                if retire_prior > self._peer_retire_prior_to:
+                    self._peer_retire_prior_to = retire_prior
+                    self._retire_connection_ids_prior_to(retire_prior)
+            elif frame_type == 0x19:  # RETIRE_CONNECTION_ID (from peer)
+                ack_eliciting = True
+                seq_num, consumed = decode_varint(payload, offset)
+                offset += consumed
+                if self.debug:
+                    print(f"        RETIRE_CONNECTION_ID: seq={seq_num}")
+                # Peer is retiring one of our connection IDs - remove from alt_connection_ids
+                self.alt_connection_ids = [(s, c, t) for s, c, t in self.alt_connection_ids if s != seq_num]
             elif frame_type == 0x07:  # NEW_TOKEN
                 ack_eliciting = True
                 token_length, consumed = decode_varint(payload, offset)
@@ -2297,6 +2510,14 @@ class RealtimeQUICClient:
                         elif result.get("type") == "qpack_table_updated":
                             if self.debug:
                                 print(f"          📊 QPACK table updated: {result.get('new_entries')} new entries")
+                        elif result.get("type") == "goaway_received":
+                            # Handle GOAWAY frame - peer initiating graceful shutdown
+                            self.goaway_received = True
+                            self.goaway_last_stream_id = result.get("stream_id", 0)
+                            if self.debug:
+                                print(f"          🚪 GOAWAY received: last_stream_id={self.goaway_last_stream_id}")
+                            # Note: We should not start new streams beyond goaway_last_stream_id
+                            # Existing streams can still complete
                     
                     # Send any pending QPACK decoder instructions
                     self._send_qpack_decoder_instructions()

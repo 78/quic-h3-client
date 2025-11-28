@@ -16,6 +16,7 @@ from .frames import (
     build_h3_qpack_decoder_stream_data,
     build_h3_headers_frame,
     build_h3_data_frame,
+    build_h3_goaway_frame,
     build_qpack_request_headers,
     parse_h3_frames,
     parse_h3_settings,

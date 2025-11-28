@@ -557,6 +557,143 @@ async def http3_chat_stream(hostname: str, port: int, ogg_file: str,
     return client
 
 
+async def test_retire_connection_id(hostname: str, port: int, debug: bool = True,
+                                    keylog_file: str = None, session_file: str = None):
+    """
+    Test RETIRE_CONNECTION_ID functionality.
+    
+    This test:
+    1. Establishes a QUIC connection
+    2. Waits for NEW_CONNECTION_ID frames from server
+    3. Manually retires a connection ID
+    4. Sends a request to verify connection still works
+    
+    Args:
+        hostname: Target hostname
+        port: Target port
+        debug: Enable debug output
+        keylog_file: Path to write keys
+        session_file: Path to session file for 0-RTT
+    """
+    print("=" * 60)
+    print("RETIRE_CONNECTION_ID Test")
+    print("=" * 60)
+    
+    if keylog_file:
+        print(f"    Key log file: {keylog_file}")
+    if session_file:
+        print(f"    Session file: {session_file}")
+    
+    print(f"\n[1] Connecting to {hostname}:{port}...")
+    client = RealtimeQUICClient(hostname, port, debug=debug, keylog_file=keylog_file,
+                                 session_file=session_file)
+    
+    try:
+        await client.connect()
+        
+        print(f"\n[2] Starting QUIC handshake...")
+        success = await client.do_handshake(timeout=5.0)
+        
+        if success:
+            print(f"\n[3] Handshake result: SUCCESS ✅")
+            
+            # Print handshake summary
+            print(f"\n    === Handshake Summary ===")
+            print(f"    Initial packets received: {len(client.initial_tracker.received_pns)}")
+            print(f"    Handshake packets received: {len(client.handshake_tracker.received_pns)}")
+            
+            # Wait a bit for NEW_CONNECTION_ID frames
+            print(f"\n[4] Waiting for NEW_CONNECTION_ID frames...")
+            print("-" * 40)
+            await asyncio.sleep(0.5)
+            
+            # Print received connection IDs
+            print(f"\n    === Peer Connection IDs ===")
+            if client.peer_connection_ids:
+                for seq, info in sorted(client.peer_connection_ids.items()):
+                    status = "retired" if info.get('retired') else "active"
+                    print(f"    [{seq}] {info['cid'].hex()[:16]}... ({status})")
+            else:
+                print(f"    No NEW_CONNECTION_ID frames received yet")
+            
+            # Test manual retire
+            print(f"\n[5] Testing manual RETIRE_CONNECTION_ID...")
+            print("-" * 40)
+            
+            # Find an active connection ID to retire (prefer lower sequence numbers)
+            active_cids = [(seq, info) for seq, info in client.peer_connection_ids.items() 
+                          if not info.get('retired')]
+            
+            if active_cids:
+                # Retire the first active connection ID (lowest sequence number)
+                seq_to_retire = min(seq for seq, _ in active_cids)
+                print(f"    Retiring connection ID with sequence={seq_to_retire}")
+                client.send_retire_connection_id(seq_to_retire)
+                
+                # Wait a bit for response
+                await asyncio.sleep(0.3)
+                
+                # Print updated status
+                print(f"\n    === Updated Connection ID Status ===")
+                for seq, info in sorted(client.peer_connection_ids.items()):
+                    status = "retired" if info.get('retired') else "active"
+                    print(f"    [{seq}] {info['cid'].hex()[:16]}... ({status})")
+            else:
+                print(f"    ⚠️ No active connection IDs to retire")
+            
+            # Verify connection still works by sending a request
+            print(f"\n[6] Verifying connection with HTTP/3 request...")
+            print("-" * 40)
+            
+            response = await client.request(
+                method="GET",
+                path="/health",
+                headers={"accept": "*/*"},
+                timeout=10.0
+            )
+            
+            if response.get("error"):
+                print(f"    ❌ Request failed: {response['error']}")
+            else:
+                print(f"    ✅ Request succeeded: status={response.get('status')}")
+            
+            # Close connection
+            print(f"\n[7] Closing connection...")
+            print("-" * 40)
+            client.send_connection_close()
+            
+        else:
+            print(f"\n[3] Handshake result: FAILED ❌")
+            
+    except KeyboardInterrupt:
+        print(f"\n\n[!] Ctrl+C received, exiting...")
+    except Exception as e:
+        print(f"\n[!] Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Print final statistics
+        print(f"\n    === Final Statistics ===")
+        print(f"    UDP packets received: {client.packets_received}")
+        print(f"    Bytes received: {client.bytes_received}")
+        print(f"    Packets sent: {client.packets_sent}")
+        print(f"    Peer connection IDs tracked: {len(client.peer_connection_ids)}")
+        retired_count = sum(1 for info in client.peer_connection_ids.values() if info.get('retired'))
+        print(f"    Connection IDs retired: {retired_count}")
+        
+        # Check if peer closed the connection
+        if client._peer_closed:
+            print(f"\n    ⚠️ Connection closed by peer:")
+            print(f"       Error code: {client._peer_close_error_code}")
+            if client._peer_close_reason:
+                print(f"       Reason: {client._peer_close_reason}")
+        
+        client.close()
+    
+    print("\n" + "=" * 60)
+    return client
+
+
 async def realtime_quic_handshake(hostname: str, port: int, debug: bool = True, keylog_file: str = None):
     """
     Perform QUIC handshake with real-time packet processing.
@@ -743,6 +880,13 @@ Examples:
         help="Disable debug output"
     )
     
+    parser.add_argument(
+        "--test-retire-cid",
+        dest="test_retire_cid",
+        action="store_true",
+        help="Test RETIRE_CONNECTION_ID functionality"
+    )
+    
     args = parser.parse_args()
     
     # Extract values
@@ -758,10 +902,14 @@ Examples:
     ogg_file = args.ogg
     paths = args.paths
     debug = not args.quiet
+    test_retire_cid = args.test_retire_cid
     
     print(f"HTTP/3 Client - Keys will be written to {keylog_file} (Wireshark SSLKEYLOGFILE format)")
     
-    if chat_mode:
+    if test_retire_cid:
+        print(f"Mode: TEST RETIRE_CONNECTION_ID")
+        print(f"Target: https://{hostname}:{port}")
+    elif chat_mode:
         print(f"Mode: CHAT STREAM")
         print(f"Target: https://{hostname}:{port}/pocket-sage/chat/stream")
         print(f"OGG file: {ogg_file}")
@@ -787,7 +935,10 @@ Examples:
     print(f"Press Ctrl+C to exit\n")
     
     try:
-        if chat_mode:
+        if test_retire_cid:
+            asyncio.run(test_retire_connection_id(hostname, port, debug=debug,
+                                                   keylog_file=keylog_file, session_file=session_file))
+        elif chat_mode:
             asyncio.run(http3_chat_stream(hostname, port, ogg_file, debug=debug,
                                            keylog_file=keylog_file, session_file=session_file))
         elif zero_rtt_mode:
