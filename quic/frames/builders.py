@@ -328,3 +328,47 @@ def build_path_response_frame(data: bytes) -> bytes:
     frame += data
     return frame
 
+
+def build_datagram_frame(data: bytes, include_length: bool = True) -> bytes:
+    """
+    Build QUIC DATAGRAM frame (RFC 9221).
+    
+    DATAGRAM frames are used to transmit application data with unreliable delivery.
+    They are not retransmitted on loss and are not subject to flow control.
+    
+    Frame Types:
+    - 0x30: DATAGRAM without Length field (data extends to end of packet)
+    - 0x31: DATAGRAM with Length field
+    
+    Frame format (with length):
+    - Type (varint): 0x31
+    - Length (varint): Length of data
+    - Datagram Data: Application data
+    
+    Frame format (without length):
+    - Type (varint): 0x30
+    - Datagram Data: Application data (extends to end of packet)
+    
+    Args:
+        data: Application data to send as datagram
+        include_length: If True, include length field (0x31), otherwise (0x30)
+        
+    Returns:
+        bytes: Complete DATAGRAM frame
+        
+    Notes:
+        - DATAGRAM frames can only be sent after both endpoints have advertised
+          max_datagram_frame_size transport parameter
+        - The data size must not exceed the peer's max_datagram_frame_size
+        - DATAGRAM frames are ack-eliciting but unreliable
+    """
+    if include_length:
+        frame = encode_varint(0x31)  # DATAGRAM with Length
+        frame += encode_varint(len(data))
+        frame += data
+    else:
+        frame = encode_varint(0x30)  # DATAGRAM without Length
+        frame += data
+    
+    return frame
+

@@ -98,12 +98,14 @@ def build_alpn_extension(protocols: list = None) -> bytes:
     return build_extension(EXT_ALPN, data)
 
 
-def build_quic_transport_params(scid: bytes) -> bytes:
+def build_quic_transport_params(scid: bytes, max_datagram_frame_size: int = 0) -> bytes:
     """
     Build QUIC transport parameters extension.
     
     Args:
         scid: Source Connection ID
+        max_datagram_frame_size: Maximum DATAGRAM frame size to advertise (0 = disabled)
+                                 If > 0, enables DATAGRAM extension (RFC 9221)
         
     Returns:
         bytes: Transport parameters extension
@@ -169,6 +171,14 @@ def build_quic_transport_params(scid: bytes) -> bytes:
     params += encode_varint(0x0f)
     params += encode_varint(len(scid))
     params += scid
+    
+    # max_datagram_frame_size (0x20) - DATAGRAM extension (RFC 9221)
+    # Only advertise if enabled (value > 0)
+    # A value of 65535 allows maximum size datagrams within MTU constraints
+    if max_datagram_frame_size > 0:
+        params += encode_varint(0x20)  # type: max_datagram_frame_size
+        params += encode_varint(4)      # length
+        params += encode_varint(max_datagram_frame_size)
     
     return build_extension(EXT_QUIC_TRANSPORT_PARAMS, params)
 

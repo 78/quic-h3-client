@@ -54,6 +54,10 @@ FRAME_CONNECTION_CLOSE = 0x1c
 FRAME_CONNECTION_CLOSE_APP = 0x1d
 FRAME_HANDSHAKE_DONE = 0x1e
 
+# DATAGRAM Frame Types (RFC 9221)
+FRAME_DATAGRAM = 0x30       # DATAGRAM without Length field
+FRAME_DATAGRAM_LEN = 0x31   # DATAGRAM with Length field
+
 # QUIC Transport Parameters (RFC 9000 Section 18)
 TRANSPORT_PARAM_NAMES = {
     0x00: "original_destination_connection_id",
@@ -73,7 +77,12 @@ TRANSPORT_PARAM_NAMES = {
     0x0e: "active_connection_id_limit",
     0x0f: "initial_source_connection_id",
     0x10: "retry_source_connection_id",
+    # DATAGRAM Extension (RFC 9221)
+    0x20: "max_datagram_frame_size",
 }
+
+# Transport parameter ID for DATAGRAM support
+TRANSPORT_PARAM_MAX_DATAGRAM_FRAME_SIZE = 0x20
 
 # Binary transport parameters (connection IDs, tokens)
 TRANSPORT_PARAM_BINARY = {0x00, 0x02, 0x0f, 0x10}

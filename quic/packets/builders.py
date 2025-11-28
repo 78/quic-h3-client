@@ -197,7 +197,8 @@ def build_handshake_packet(secrets: dict, dcid: bytes, scid: bytes,
     return protected_header + encrypted_payload
 
 
-def create_initial_packet(hostname: str, debug: bool = False) -> tuple:
+def create_initial_packet(hostname: str, debug: bool = False,
+                          max_datagram_frame_size: int = 0) -> tuple:
     """
     Create complete QUIC Initial packet with ClientHello.
     
@@ -206,6 +207,7 @@ def create_initial_packet(hostname: str, debug: bool = False) -> tuple:
     Args:
         hostname: Target hostname for SNI
         debug: Enable debug output
+        max_datagram_frame_size: Max DATAGRAM frame size to advertise (0 = disabled)
         
     Returns:
         tuple: (packet, dcid, scid, private_key, client_hello, client_random)
@@ -225,7 +227,9 @@ def create_initial_packet(hostname: str, debug: bool = False) -> tuple:
     )
     
     # Build ClientHello
-    client_hello, client_random = build_client_hello(hostname, scid, public_key)
+    client_hello, client_random = build_client_hello(
+        hostname, scid, public_key, max_datagram_frame_size
+    )
     
     if debug:
         print(f"  [DEBUG] ClientHello length: {len(client_hello)} bytes")
@@ -412,7 +416,8 @@ def create_initial_packet_with_retry_token(
     return packet
 
 
-def create_initial_packet_with_psk(hostname: str, session_ticket, debug: bool = False) -> tuple:
+def create_initial_packet_with_psk(hostname: str, session_ticket, debug: bool = False,
+                                    max_datagram_frame_size: int = 0) -> tuple:
     """
     Create complete QUIC Initial packet with PSK-based ClientHello for 0-RTT.
     
@@ -422,6 +427,7 @@ def create_initial_packet_with_psk(hostname: str, session_ticket, debug: bool = 
         hostname: Target hostname for SNI
         session_ticket: SessionTicket object for resumption
         debug: Enable debug output
+        max_datagram_frame_size: Max DATAGRAM frame size to advertise (0 = disabled)
         
     Returns:
         tuple: (packet, dcid, scid, private_key, client_hello, client_random, psk, early_secret)
@@ -443,7 +449,8 @@ def create_initial_packet_with_psk(hostname: str, session_ticket, debug: bool = 
     
     # Build ClientHello with PSK
     client_hello, client_random, psk = build_client_hello_with_psk(
-        hostname, scid, public_key, session_ticket, include_early_data=True
+        hostname, scid, public_key, session_ticket, include_early_data=True,
+        max_datagram_frame_size=max_datagram_frame_size
     )
     
     if debug:

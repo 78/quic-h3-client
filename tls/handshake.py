@@ -20,7 +20,8 @@ from .extensions import (
 from .session import parse_new_session_ticket, SessionTicket
 
 
-def build_client_hello(hostname: str, scid: bytes, x25519_public_key: bytes) -> tuple:
+def build_client_hello(hostname: str, scid: bytes, x25519_public_key: bytes,
+                       max_datagram_frame_size: int = 0) -> tuple:
     """
     Build complete TLS 1.3 ClientHello.
     
@@ -28,6 +29,7 @@ def build_client_hello(hostname: str, scid: bytes, x25519_public_key: bytes) -> 
         hostname: Server hostname for SNI
         scid: Source Connection ID for transport params
         x25519_public_key: Client's X25519 public key
+        max_datagram_frame_size: Max DATAGRAM frame size to advertise (0 = disabled)
     
     Returns:
         tuple: (handshake_message, client_random)
@@ -40,7 +42,7 @@ def build_client_hello(hostname: str, scid: bytes, x25519_public_key: bytes) -> 
     extensions += build_supported_groups_extension()
     extensions += build_server_name_extension(hostname)
     extensions += build_alpn_extension()
-    extensions += build_quic_transport_params(scid)
+    extensions += build_quic_transport_params(scid, max_datagram_frame_size)
     # Add psk_key_exchange_modes to indicate we support session resumption
     extensions += build_psk_key_exchange_modes_extension()
     
@@ -70,7 +72,8 @@ def build_client_hello(hostname: str, scid: bytes, x25519_public_key: bytes) -> 
 
 
 def build_client_hello_with_psk(hostname: str, scid: bytes, x25519_public_key: bytes,
-                                 session_ticket: SessionTicket, include_early_data: bool = True) -> tuple:
+                                 session_ticket: SessionTicket, include_early_data: bool = True,
+                                 max_datagram_frame_size: int = 0) -> tuple:
     """
     Build TLS 1.3 ClientHello with PSK extension for 0-RTT resumption.
     
@@ -83,6 +86,7 @@ def build_client_hello_with_psk(hostname: str, scid: bytes, x25519_public_key: b
         x25519_public_key: Client's X25519 public key
         session_ticket: Session ticket for resumption
         include_early_data: Whether to include early_data extension for 0-RTT
+        max_datagram_frame_size: Max DATAGRAM frame size to advertise (0 = disabled)
     
     Returns:
         tuple: (handshake_message, client_random, psk)
@@ -105,7 +109,7 @@ def build_client_hello_with_psk(hostname: str, scid: bytes, x25519_public_key: b
     extensions += build_key_share_extension(x25519_public_key)
     extensions += build_supported_versions_extension()
     extensions += build_alpn_extension()
-    extensions += build_quic_transport_params(scid)
+    extensions += build_quic_transport_params(scid, max_datagram_frame_size)
     extensions += build_psk_key_exchange_modes_extension()
     
     # Include early_data extension if requested

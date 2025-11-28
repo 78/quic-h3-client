@@ -49,6 +49,7 @@ class FrameProcessor:
         self.on_max_streams_uni: Optional[Callable[[int], None]] = None
         self.on_retire_connection_id: Optional[Callable[[int], None]] = None  # seq
         self.on_new_token: Optional[Callable[[bytes], None]] = None  # token
+        self.on_datagram: Optional[Callable[[bytes], None]] = None  # datagram data
     
     def process_payload(self, payload: bytes) -> bool:
         """
@@ -231,6 +232,11 @@ class FrameProcessor:
                 if self.on_handshake_done:
                     self.on_handshake_done()
             
+            # DATAGRAM (0x30 - without length, 0x31 - with length) - RFC 9221
+            elif frame_type == 0x30 or frame_type == 0x31:
+                ack_eliciting = True
+                offset = self._parse_datagram(payload, offset, frame_type)
+            
             # Unknown frame type
             else:
                 if self.debug:
@@ -411,6 +417,43 @@ class FrameProcessor:
         
         if self.on_connection_close:
             self.on_connection_close(error_code, reason, is_app)
+        
+        return offset
+    
+    def _parse_datagram(self, payload: bytes, offset: int, frame_type: int) -> int:
+        """
+        Parse DATAGRAM frame (RFC 9221).
+        
+        Frame Types:
+        - 0x30: DATAGRAM without Length field (data extends to end of packet)
+        - 0x31: DATAGRAM with Length field
+        
+        Args:
+            payload: Packet payload
+            offset: Current offset after frame type
+            frame_type: 0x30 or 0x31
+            
+        Returns:
+            int: New offset after parsing
+        """
+        has_length = (frame_type == 0x31)
+        
+        if has_length:
+            # DATAGRAM with Length field
+            length, consumed = decode_varint(payload, offset)
+            offset += consumed
+            data = payload[offset:offset + length]
+            offset += length
+        else:
+            # DATAGRAM without Length field - data extends to end of packet
+            data = payload[offset:]
+            offset = len(payload)
+        
+        if self.debug:
+            print(f"        DATAGRAM: len={len(data)}, has_length={has_length}")
+        
+        if self.on_datagram:
+            self.on_datagram(data)
         
         return offset
 

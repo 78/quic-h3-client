@@ -107,6 +107,13 @@
 - ✅ CONNECTION_CLOSE (0x1c)
 - ✅ CONNECTION_CLOSE_APP (0x1d)
 - ✅ HANDSHAKE_DONE (0x1e)
+- ✅ DATAGRAM (0x30/0x31) - RFC 9221 扩展
+
+#### DATAGRAM 扩展 (RFC 9221)
+- ✅ **max_datagram_frame_size**: Transport Parameter 协商
+- ✅ **DATAGRAM 帧**: 发送和接收不可靠数据报
+- ✅ **可配置支持**: 通过 `enable_datagram` 参数启用
+- ✅ **异步接收**: `recv_datagram()` 异步 API
 
 ### HTTP/3 协议层
 
@@ -200,10 +207,27 @@
 
 ### 扩展功能（可选）
 
-#### ⚪ DATAGRAM 帧
-- ❌ **RFC 9221**: DATAGRAM 扩展支持
+#### ✅ DATAGRAM 帧 (已实现)
+- ✅ **RFC 9221**: DATAGRAM 扩展支持
+- ✅ `max_datagram_frame_size` Transport Parameter 协商
+- ✅ 发送和接收 DATAGRAM 帧 (0x30/0x31)
+- ✅ 异步接收 API (`recv_datagram()`, `recv_datagram_nowait()`)
 
 **用途**: WebRTC、实时游戏等低延迟场景
+
+**用法**:
+```python
+# 创建连接时启用 DATAGRAM
+client = QuicConnection("example.com", 443, enable_datagram=True)
+
+# 检查是否可用
+if client.datagram_available:
+    # 发送数据报
+    client.send_datagram(b"Hello!")
+    
+    # 异步接收数据报
+    data = await client.recv_datagram(timeout=5.0)
+```
 
 #### ⚪ WebTransport
 - ❌ **WebTransport over HTTP/3**: 双向流传输
@@ -332,12 +356,21 @@ http3-client/
 - [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html): QUIC Loss Detection and Congestion Control
 - [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html): HTTP/3
 - [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204.html): QPACK: Header Compression for HTTP/3
+- [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html): An Unreliable Datagram Extension to QUIC
 
 ---
 
 ## 📝 更新日志
 
 ### 最新更新
+- ✅ 实现 DATAGRAM 扩展（RFC 9221）
+  - 添加 `max_datagram_frame_size` Transport Parameter
+  - 支持发送 DATAGRAM 帧 (0x30/0x31)
+  - 支持接收 DATAGRAM 帧并通过回调处理
+  - 添加 `send_datagram()` 方法发送不可靠数据报
+  - 添加 `recv_datagram()` 和 `recv_datagram_nowait()` 接收 API
+  - 添加 `datagram_available` 和 `max_datagram_size` 属性
+  - 通过 `enable_datagram=True` 参数启用
 - ✅ 实现 PATH_CHALLENGE 和 PATH_RESPONSE（RFC 9000 Section 19.17-19.18）
   - 支持发送和接收 PATH_CHALLENGE (0x1a) 帧
   - 自动响应服务器发送的 PATH_CHALLENGE，发送 PATH_RESPONSE (0x1b) 帧

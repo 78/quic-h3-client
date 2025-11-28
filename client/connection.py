@@ -27,6 +27,7 @@ from quic.frames import (
     build_stream_frame, build_new_connection_id_frame,
     build_retire_connection_id_frame, build_connection_close_frame,
     parse_quic_frames, build_path_challenge_frame, build_path_response_frame,
+    build_datagram_frame,
 )
 from quic.packets import (
     build_initial_packet_with_secrets, build_handshake_packet,
@@ -165,15 +166,29 @@ class QuicConnection:
     - Packet sending and receiving
     - Handshake state machine
     - High-level request/response API
+    - DATAGRAM support (RFC 9221)
     """
     
+    # Default maximum DATAGRAM frame size (0 = disabled)
+    # Set to 65535 to enable DATAGRAM with maximum size
+    DEFAULT_MAX_DATAGRAM_FRAME_SIZE = 65535
+    
     def __init__(self, hostname: str, port: int, debug: bool = True,
-                 keylog_file: str = None, session_file: str = None):
+                 keylog_file: str = None, session_file: str = None,
+                 enable_datagram: bool = False, max_datagram_frame_size: int = None):
         self.hostname = hostname
         self.port = port
         self.debug = debug
         self.keylog_file = keylog_file
         self.session_file = session_file
+        
+        # DATAGRAM configuration (RFC 9221)
+        self.datagram_enabled = enable_datagram
+        self.local_max_datagram_frame_size = (
+            max_datagram_frame_size if max_datagram_frame_size is not None
+            else (self.DEFAULT_MAX_DATAGRAM_FRAME_SIZE if enable_datagram else 0)
+        )
+        self.peer_max_datagram_frame_size = 0  # Will be set from peer's transport params
         
         # Network
         self.target_ip: Optional[str] = None
@@ -236,6 +251,10 @@ class QuicConnection:
         self.connection_closed = asyncio.Event()
         self._cwnd_available = asyncio.Event()
         self._cwnd_available.set()
+        
+        # DATAGRAM receive queue
+        self._datagram_queue: asyncio.Queue = asyncio.Queue()
+        self._datagram_received = asyncio.Event()
         
         # Peer state
         self._peer_closed = False
@@ -309,6 +328,7 @@ class QuicConnection:
         fp.on_reset_stream = self._on_frame_reset_stream
         fp.on_stop_sending = self._on_frame_stop_sending
         fp.on_retire_connection_id = self._on_frame_retire_connection_id
+        fp.on_datagram = self._on_frame_datagram
     
     def _on_keys_derived(self, level: str, secrets: dict):
         """Callback when keys are derived - write to keylog."""
@@ -396,7 +416,10 @@ class QuicConnection:
         """Normal 1-RTT handshake."""
         # Generate Initial packet
         packet, dcid, scid, private_key, client_hello, client_random = \
-            create_initial_packet(self.hostname, debug=self.debug)
+            create_initial_packet(
+                self.hostname, debug=self.debug,
+                max_datagram_frame_size=self.local_max_datagram_frame_size
+            )
         
         self.original_dcid = dcid
         self.our_scid = scid
@@ -449,7 +472,10 @@ class QuicConnection:
         self.crypto.zero_rtt_enabled = True
         
         # Generate Initial with PSK
-        result = create_initial_packet_with_psk(self.hostname, session_ticket, debug=self.debug)
+        result = create_initial_packet_with_psk(
+            self.hostname, session_ticket, debug=self.debug,
+            max_datagram_frame_size=self.local_max_datagram_frame_size
+        )
         packet, dcid, scid, private_key, client_hello, client_random, psk, early_secret = result
         
         self.original_dcid = dcid
@@ -798,6 +824,15 @@ class QuicConnection:
                     if isinstance(value, str) and "ms" in value:
                         ms = int(value.replace("ms", "").strip())
                         self.loss_detector.max_ack_delay = ms / 1000.0
+                
+                # Update DATAGRAM support (RFC 9221)
+                if "max_datagram_frame_size" in params:
+                    peer_value = params["max_datagram_frame_size"]
+                    if isinstance(peer_value, int):
+                        self.peer_max_datagram_frame_size = peer_value
+                        if self.debug and self.datagram_enabled:
+                            print(f"    📦 Peer supports DATAGRAM (max_size={peer_value})")
+                
                 break
     
     def _send_client_finished(self):
@@ -1105,6 +1140,20 @@ class QuicConnection:
         """Handle RETIRE_CONNECTION_ID frame from peer."""
         # Peer is retiring one of our connection IDs
         self.alt_connection_ids = [(s, c, t) for s, c, t in self.alt_connection_ids if s != seq_num]
+    
+    def _on_frame_datagram(self, data: bytes):
+        """Handle DATAGRAM frame."""
+        if self.debug:
+            print(f"    📨 DATAGRAM received: {len(data)} bytes")
+        
+        # Add to queue for async consumption
+        try:
+            self._datagram_queue.put_nowait(data)
+            self._datagram_received.set()
+        except asyncio.QueueFull:
+            if self.debug:
+                print(f"    ⚠️ DATAGRAM queue full, dropping")
+            pass
     
     # =========================================================================
     # Key discard
@@ -1616,7 +1665,10 @@ class QuicConnection:
         self.crypto.zero_rtt_enabled = True
         
         # Generate Initial with PSK
-        result = create_initial_packet_with_psk(self.hostname, session_ticket, debug=self.debug)
+        result = create_initial_packet_with_psk(
+            self.hostname, session_ticket, debug=self.debug,
+            max_datagram_frame_size=self.local_max_datagram_frame_size
+        )
         packet, dcid, scid, private_key, client_hello, client_random, psk, early_secret = result
         
         self.original_dcid = dcid
@@ -1656,6 +1708,140 @@ class QuicConnection:
             }
         except asyncio.TimeoutError:
             return {"status": None, "headers": [], "body": b"", "error": "response timeout", "0rtt": True}
+
+
+    # =========================================================================
+    # DATAGRAM API (RFC 9221)
+    # =========================================================================
+    
+    def can_send_datagram(self, size: int = 0) -> bool:
+        """
+        Check if DATAGRAM can be sent.
+        
+        DATAGRAM can only be sent if:
+        1. We have enabled DATAGRAM support (datagram_enabled=True)
+        2. Peer has advertised max_datagram_frame_size > 0
+        3. (Optional) The data size fits within peer's limit
+        
+        Args:
+            size: Size of data to send (0 to just check if enabled)
+            
+        Returns:
+            bool: True if DATAGRAM can be sent
+        """
+        if not self.datagram_enabled:
+            return False
+        if self.peer_max_datagram_frame_size == 0:
+            return False
+        if size > 0 and size > self.peer_max_datagram_frame_size:
+            return False
+        return True
+    
+    def send_datagram(self, data: bytes) -> bool:
+        """
+        Send an unreliable DATAGRAM.
+        
+        DATAGRAM frames provide unreliable delivery of application data.
+        They are ack-eliciting but NOT retransmitted on loss.
+        
+        Args:
+            data: Application data to send
+            
+        Returns:
+            bool: True if sent successfully, False if DATAGRAM not available
+            
+        Raises:
+            ValueError: If data exceeds peer's max_datagram_frame_size
+            RuntimeError: If handshake not complete
+        """
+        if not self.crypto.has_application_keys:
+            raise RuntimeError("Handshake not complete")
+        
+        if not self.can_send_datagram(len(data)):
+            if not self.datagram_enabled:
+                if self.debug:
+                    print(f"    ⚠️ DATAGRAM not enabled")
+                return False
+            if self.peer_max_datagram_frame_size == 0:
+                if self.debug:
+                    print(f"    ⚠️ Peer doesn't support DATAGRAM")
+                return False
+            if len(data) > self.peer_max_datagram_frame_size:
+                raise ValueError(
+                    f"DATAGRAM data ({len(data)} bytes) exceeds peer limit "
+                    f"({self.peer_max_datagram_frame_size} bytes)"
+                )
+        
+        # Build and send DATAGRAM frame
+        dcid = self.server_scid or self.original_dcid
+        frame = build_datagram_frame(data, include_length=True)
+        packet = self.crypto.build_short_header_packet(dcid, self.client_app_pn, frame)
+        
+        # Track sent packet (but DATAGRAM is not retransmitted)
+        self._track_sent_packet(
+            PacketNumberSpace.APPLICATION,
+            self.client_app_pn,
+            len(packet),
+            frames=[{"type": "DATAGRAM", "data": data, "retransmit": False}]
+        )
+        
+        self.send(packet)
+        self.client_app_pn += 1
+        
+        if self.debug:
+            print(f"    → DATAGRAM sent: {len(data)} bytes")
+        
+        return True
+    
+    async def recv_datagram(self, timeout: float = None) -> Optional[bytes]:
+        """
+        Receive a DATAGRAM.
+        
+        Waits for and returns the next received DATAGRAM.
+        
+        Args:
+            timeout: Timeout in seconds (None = wait forever)
+            
+        Returns:
+            bytes: Received datagram data, or None on timeout
+        """
+        try:
+            if timeout is not None:
+                return await asyncio.wait_for(
+                    self._datagram_queue.get(), timeout=timeout
+                )
+            else:
+                return await self._datagram_queue.get()
+        except asyncio.TimeoutError:
+            return None
+    
+    def recv_datagram_nowait(self) -> Optional[bytes]:
+        """
+        Receive a DATAGRAM without waiting.
+        
+        Returns:
+            bytes: Received datagram data, or None if no datagrams available
+        """
+        try:
+            return self._datagram_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+    
+    @property
+    def datagram_available(self) -> bool:
+        """Check if DATAGRAM is available (both sides support it)."""
+        return self.datagram_enabled and self.peer_max_datagram_frame_size > 0
+    
+    @property
+    def max_datagram_size(self) -> int:
+        """
+        Get the maximum DATAGRAM size that can be sent.
+        
+        Returns minimum of local and peer limits, or 0 if not available.
+        """
+        if not self.datagram_available:
+            return 0
+        return min(self.local_max_datagram_frame_size, self.peer_max_datagram_frame_size)
 
 
 # Alias for backward compatibility
