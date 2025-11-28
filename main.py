@@ -36,7 +36,7 @@ Examples:
 
 import argparse
 import asyncio
-from client import RealtimeQUICClient
+from client import QuicConnection
 
 
 def print_response(path: str, response: dict):
@@ -95,7 +95,7 @@ async def http3_concurrent_requests(hostname: str, port: int, paths: list,
         print(f"    Session file: {session_file}")
     
     print(f"\n[1] Connecting to {hostname}:{port}...")
-    client = RealtimeQUICClient(hostname, port, debug=debug, keylog_file=keylog_file,
+    client = QuicConnection(hostname, port, debug=debug, keylog_file=keylog_file,
                                  session_file=session_file)
     
     try:
@@ -109,8 +109,8 @@ async def http3_concurrent_requests(hostname: str, port: int, paths: list,
             
             # Print handshake summary
             print(f"\n    === Handshake Summary ===")
-            print(f"    Initial packets received: {len(client.initial_tracker.received_pns)}")
-            print(f"    Handshake packets received: {len(client.handshake_tracker.received_pns)}")
+            print(f"    Initial packets received: {len(client.ack.initial_tracker.received_pns)}")
+            print(f"    Handshake packets received: {len(client.ack.handshake_tracker.received_pns)}")
             print(f"    Initial CRYPTO: {client.initial_crypto_buffer.total_received} bytes")
             print(f"    Handshake CRYPTO: {client.handshake_crypto_buffer.total_received} bytes")
             
@@ -166,9 +166,9 @@ async def http3_concurrent_requests(hostname: str, port: int, paths: list,
         print(f"    UDP packets received: {client.packets_received}")
         print(f"    Bytes received: {client.bytes_received}")
         print(f"    Packets sent: {client.packets_sent}")
-        print(f"    Initial packets: {len(client.initial_tracker.received_pns)}")
-        print(f"    Handshake packets: {len(client.handshake_tracker.received_pns)}")
-        print(f"    1-RTT packets: {len(client.app_tracker.received_pns)}")
+        print(f"    Initial packets: {len(client.ack.initial_tracker.received_pns)}")
+        print(f"    Handshake packets: {len(client.ack.handshake_tracker.received_pns)}")
+        print(f"    1-RTT packets: {len(client.ack.app_tracker.received_pns)}")
         
         # Check if peer closed the connection
         if client._peer_closed:
@@ -207,7 +207,7 @@ async def http3_request(hostname: str, port: int, path: str = "/",
         print(f"    Session file: {session_file}")
     
     print(f"\n[1] Connecting to {hostname}:{port}...")
-    client = RealtimeQUICClient(hostname, port, debug=debug, keylog_file=keylog_file,
+    client = QuicConnection(hostname, port, debug=debug, keylog_file=keylog_file,
                                  session_file=session_file)
     
     try:
@@ -221,8 +221,8 @@ async def http3_request(hostname: str, port: int, path: str = "/",
             
             # Print handshake summary
             print(f"\n    === Handshake Summary ===")
-            print(f"    Initial packets received: {len(client.initial_tracker.received_pns)}")
-            print(f"    Handshake packets received: {len(client.handshake_tracker.received_pns)}")
+            print(f"    Initial packets received: {len(client.ack.initial_tracker.received_pns)}")
+            print(f"    Handshake packets received: {len(client.ack.handshake_tracker.received_pns)}")
             print(f"    Initial CRYPTO: {client.initial_crypto_buffer.total_received} bytes")
             print(f"    Handshake CRYPTO: {client.handshake_crypto_buffer.total_received} bytes")
             if client.zero_rtt_enabled:
@@ -283,9 +283,9 @@ async def http3_request(hostname: str, port: int, path: str = "/",
         print(f"    UDP packets received: {client.packets_received}")
         print(f"    Bytes received: {client.bytes_received}")
         print(f"    Packets sent: {client.packets_sent}")
-        print(f"    Initial packets: {len(client.initial_tracker.received_pns)}")
-        print(f"    Handshake packets: {len(client.handshake_tracker.received_pns)}")
-        print(f"    1-RTT packets: {len(client.app_tracker.received_pns)}")
+        print(f"    Initial packets: {len(client.ack.initial_tracker.received_pns)}")
+        print(f"    Handshake packets: {len(client.ack.handshake_tracker.received_pns)}")
+        print(f"    1-RTT packets: {len(client.ack.app_tracker.received_pns)}")
         if session_file and client.session_tickets:
             print(f"    Session tickets: {len(client.session_tickets)}")
         
@@ -335,7 +335,7 @@ async def http3_0rtt_request(hostname: str, port: int, path: str = "/",
     print(f"    Session file: {session_file}")
     
     print(f"\n[1] Connecting to {hostname}:{port} with 0-RTT...")
-    client = RealtimeQUICClient(hostname, port, debug=debug, keylog_file=keylog_file,
+    client = QuicConnection(hostname, port, debug=debug, keylog_file=keylog_file,
                                  session_file=session_file)
     
     try:
@@ -440,7 +440,7 @@ async def http3_chat_stream(hostname: str, port: int, ogg_file: str,
         print(f"    Session file: {session_file}")
     
     print(f"\n[1] Connecting to {hostname}:{port}...")
-    client = RealtimeQUICClient(hostname, port, debug=debug, keylog_file=keylog_file,
+    client = QuicConnection(hostname, port, debug=debug, keylog_file=keylog_file,
                                  session_file=session_file)
     
     try:
@@ -454,8 +454,8 @@ async def http3_chat_stream(hostname: str, port: int, ogg_file: str,
             
             # Print handshake summary
             print(f"\n    === Handshake Summary ===")
-            print(f"    Initial packets received: {len(client.initial_tracker.received_pns)}")
-            print(f"    Handshake packets received: {len(client.handshake_tracker.received_pns)}")
+            print(f"    Initial packets received: {len(client.ack.initial_tracker.received_pns)}")
+            print(f"    Handshake packets received: {len(client.ack.handshake_tracker.received_pns)}")
             
             # Send HTTP/3 POST request using streaming API
             print(f"\n[4] Opening stream for /pocket-sage/chat/stream...")
@@ -587,7 +587,7 @@ async def test_retire_connection_id(hostname: str, port: int, debug: bool = True
         print(f"    Session file: {session_file}")
     
     print(f"\n[1] Connecting to {hostname}:{port}...")
-    client = RealtimeQUICClient(hostname, port, debug=debug, keylog_file=keylog_file,
+    client = QuicConnection(hostname, port, debug=debug, keylog_file=keylog_file,
                                  session_file=session_file)
     
     try:
@@ -601,8 +601,8 @@ async def test_retire_connection_id(hostname: str, port: int, debug: bool = True
             
             # Print handshake summary
             print(f"\n    === Handshake Summary ===")
-            print(f"    Initial packets received: {len(client.initial_tracker.received_pns)}")
-            print(f"    Handshake packets received: {len(client.handshake_tracker.received_pns)}")
+            print(f"    Initial packets received: {len(client.ack.initial_tracker.received_pns)}")
+            print(f"    Handshake packets received: {len(client.ack.handshake_tracker.received_pns)}")
             
             # Wait a bit for NEW_CONNECTION_ID frames
             print(f"\n[4] Waiting for NEW_CONNECTION_ID frames...")
@@ -709,14 +709,14 @@ async def realtime_quic_handshake(hostname: str, port: int, debug: bool = True, 
         keylog_file: Path to write keys in SSLKEYLOGFILE format for Wireshark
     """
     print("=" * 60)
-    print("QUIC Realtime Client (Legacy Mode)")
+    print("QUIC Client (Legacy Mode)")
     print("=" * 60)
     
     if keylog_file:
         print(f"    Key log file: {keylog_file}")
     
     print(f"\n[1] Connecting to {hostname}:{port}...")
-    client = RealtimeQUICClient(hostname, port, debug=debug, keylog_file=keylog_file)
+    client = QuicConnection(hostname, port, debug=debug, keylog_file=keylog_file)
     
     try:
         await client.connect()
@@ -729,8 +729,8 @@ async def realtime_quic_handshake(hostname: str, port: int, debug: bool = True, 
             
             # Print summary
             print(f"\n    === Handshake Summary ===")
-            print(f"    Initial packets received: {len(client.initial_tracker.received_pns)}")
-            print(f"    Handshake packets received: {len(client.handshake_tracker.received_pns)}")
+            print(f"    Initial packets received: {len(client.ack.initial_tracker.received_pns)}")
+            print(f"    Handshake packets received: {len(client.ack.handshake_tracker.received_pns)}")
             print(f"    Initial CRYPTO: {client.initial_crypto_buffer.total_received} bytes")
             print(f"    Handshake CRYPTO: {client.handshake_crypto_buffer.total_received} bytes")
             
@@ -755,9 +755,9 @@ async def realtime_quic_handshake(hostname: str, port: int, debug: bool = True, 
         print(f"    UDP packets received: {client.packets_received}")
         print(f"    Bytes received: {client.bytes_received}")
         print(f"    Packets sent: {client.packets_sent}")
-        print(f"    Initial packets: {len(client.initial_tracker.received_pns)}")
-        print(f"    Handshake packets: {len(client.handshake_tracker.received_pns)}")
-        print(f"    1-RTT packets: {len(client.app_tracker.received_pns)}")
+        print(f"    Initial packets: {len(client.ack.initial_tracker.received_pns)}")
+        print(f"    Handshake packets: {len(client.ack.handshake_tracker.received_pns)}")
+        print(f"    1-RTT packets: {len(client.ack.app_tracker.received_pns)}")
         
         # Check if peer closed the connection
         if client._peer_closed:

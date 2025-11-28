@@ -243,10 +243,10 @@ python main.py api.tenclass.net -s session.json
 
 ```python
 import asyncio
-from client import RealtimeQUICClient
+from client import QuicConnection
 
 async def main():
-    client = RealtimeQUICClient("api.example.com", 443, debug=True)
+    client = QuicConnection("api.example.com", 443, debug=True)
     await client.connect()
     
     # 发送 GET 请求
@@ -266,11 +266,14 @@ asyncio.run(main())
 
 ```
 http3-client/
-├── client/              # QUIC 客户端核心实现
-│   ├── connection.py    # 连接管理、数据包处理
-│   ├── loss_detection.py # 丢包检测和恢复
-│   ├── protocol.py      # UDP 协议封装
-│   └── state.py         # 状态管理
+├── client/              # QUIC 客户端核心实现（组件化架构）
+│   ├── connection.py    # 主协调器：连接管理、数据包处理、UDP 协议封装
+│   ├── crypto_manager.py # 密钥派生、加密/解密、Key Update
+│   ├── flow_controller.py # 流控：MAX_DATA、MAX_STREAM_DATA
+│   ├── ack_manager.py   # ACK 帧生成和跟踪
+│   ├── frame_processor.py # 帧解析和分发
+│   ├── h3_handler.py    # HTTP/3 协议层：QPACK、请求/响应处理
+│   └── loss_detection.py # 丢包检测、PTO、拥塞控制
 ├── quic/                # QUIC 协议实现
 │   ├── crypto/          # 加密相关
 │   ├── frames/          # 帧构建和解析

@@ -16,11 +16,10 @@ import asyncio
 import random
 import time
 from typing import Optional
-from client import RealtimeQUICClient
-from client.protocol import RealtimeQUICProtocol
+from client import QuicConnection, QuicProtocol
 
 
-class PacketLossProtocol(RealtimeQUICProtocol):
+class PacketLossProtocol(QuicProtocol):
     """
     Protocol wrapper that simulates packet loss for testing.
     Supports both outgoing (send) and incoming (receive) packet loss.
@@ -247,7 +246,7 @@ class PacketLossTransport:
         return self._transport.get_extra_info(name, default)
 
 
-class PacketLossQUICClient(RealtimeQUICClient):
+class PacketLossQUICClient(QuicConnection):
     """
     QUIC Client with simulated packet loss for testing.
     Supports both outgoing (client -> server) and incoming (server -> client) loss.
