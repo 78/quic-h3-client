@@ -21,6 +21,7 @@ from .keys import (
     derive_0rtt_secrets,
     derive_0rtt_application_secrets,
     derive_handshake_secrets_with_psk,
+    derive_next_application_secrets,
 )
 from .aead import (
     encrypt_payload,

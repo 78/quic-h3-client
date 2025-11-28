@@ -382,6 +382,67 @@ def derive_0rtt_application_secrets(early_secret: bytes, client_hello_hash: byte
     }
 
 
+def derive_next_application_secrets(current_secrets: dict, debug: bool = False) -> dict:
+    """
+    Derive the next generation of application secrets for Key Update (RFC 9001 Section 6).
+    
+    Key Update allows endpoints to update their 1-RTT keys during the connection.
+    The new traffic secret is derived from the current one using:
+    
+    application_traffic_secret_N+1 = HKDF-Expand-Label(
+        application_traffic_secret_N, "quic ku", "", 32
+    )
+    
+    Args:
+        current_secrets: Current application secrets dict with client/server sub-dicts
+                        containing 'traffic_secret'
+        debug: Enable debug output
+        
+    Returns:
+        dict: {client: {key, iv, hp, traffic_secret}, server: {...}}
+    """
+    # Derive next client traffic secret
+    client_traffic_secret = current_secrets["client"]["traffic_secret"]
+    next_client_traffic_secret = hkdf_expand_label(
+        client_traffic_secret, b"quic ku", b"", 32
+    )
+    
+    # Derive next server traffic secret
+    server_traffic_secret = current_secrets["server"]["traffic_secret"]
+    next_server_traffic_secret = hkdf_expand_label(
+        server_traffic_secret, b"quic ku", b"", 32
+    )
+    
+    if debug:
+        print(f"    🔑 Key Update:")
+        print(f"       Next Client Traffic Secret: {next_client_traffic_secret.hex()[:32]}...")
+        print(f"       Next Server Traffic Secret: {next_server_traffic_secret.hex()[:32]}...")
+    
+    # Derive QUIC keys from new traffic secrets
+    client_secrets = {
+        "key": hkdf_expand_label(next_client_traffic_secret, b"quic key", b"", 16),
+        "iv": hkdf_expand_label(next_client_traffic_secret, b"quic iv", b"", 12),
+        "hp": hkdf_expand_label(next_client_traffic_secret, b"quic hp", b"", 16),
+        "traffic_secret": next_client_traffic_secret,
+    }
+    
+    server_secrets = {
+        "key": hkdf_expand_label(next_server_traffic_secret, b"quic key", b"", 16),
+        "iv": hkdf_expand_label(next_server_traffic_secret, b"quic iv", b"", 12),
+        "hp": hkdf_expand_label(next_server_traffic_secret, b"quic hp", b"", 16),
+        "traffic_secret": next_server_traffic_secret,
+    }
+    
+    if debug:
+        print(f"       Next Client Key: {client_secrets['key'].hex()}")
+        print(f"       Next Server Key: {server_secrets['key'].hex()}")
+    
+    return {
+        "client": client_secrets,
+        "server": server_secrets,
+    }
+
+
 def derive_handshake_secrets_with_psk(shared_secret: bytes, transcript_hash: bytes, 
                                        psk: bytes = None, debug: bool = False) -> dict:
     """

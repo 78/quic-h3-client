@@ -23,6 +23,7 @@ from quic.crypto import (
     apply_header_protection,
     derive_resumption_master_secret, derive_0rtt_secrets,
     derive_0rtt_application_secrets, derive_handshake_secrets_with_psk,
+    derive_next_application_secrets,
 )
 from quic.frames import (
     build_crypto_frame, build_ack_frame, build_padding_frame,
@@ -198,6 +199,17 @@ class RealtimeQUICClient:
         # Key discard flags (to avoid using discarded keys)
         self._initial_keys_discarded: bool = False
         self._handshake_keys_discarded: bool = False
+        
+        # Key Update state (RFC 9001 Section 6)
+        # Key Phase bit tracks which generation of keys is in use
+        self._key_phase: int = 0  # Current key phase (0 or 1)
+        self._key_update_generation: int = 0  # Key generation counter
+        self._key_update_in_progress: bool = False  # True if we initiated key update
+        self._key_update_received_pn: Optional[int] = None  # First PN received with new key phase
+        # Store old keys for receiving packets during key update transition
+        self._previous_application_secrets: Optional[dict] = None
+        # Store next keys for initiating key update
+        self._next_application_secrets: Optional[dict] = None
         
         # Stateless reset flag
         self._stateless_reset_received: bool = False
@@ -1118,6 +1130,141 @@ class RealtimeQUICClient:
             if h3_init_packet:
                 print(f"    → Sent HTTP/3 init (1-RTT PN={h3_init_pn}, {len(h3_init_packet)} bytes)")
     
+    # =====================================================================
+    # Key Update (RFC 9001 Section 6)
+    # =====================================================================
+    
+    def initiate_key_update(self) -> bool:
+        """
+        Initiate a Key Update (RFC 9001 Section 6).
+        
+        Key Update allows the endpoint to update its 1-RTT keys during a connection.
+        The Key Phase bit in the packet header is flipped to indicate new keys.
+        
+        Conditions for initiating Key Update:
+        - Handshake must be complete (have application secrets)
+        - Cannot initiate if a key update is already in progress
+        - Should have received ACK for at least one packet with current keys
+        
+        Returns:
+            bool: True if key update was initiated, False otherwise
+        """
+        if not self.application_secrets:
+            if self.debug:
+                print(f"    ⚠️ Cannot initiate Key Update: no application secrets")
+            return False
+        
+        if self._key_update_in_progress:
+            if self.debug:
+                print(f"    ⚠️ Cannot initiate Key Update: update already in progress")
+            return False
+        
+        # Derive the next generation of application secrets
+        self._next_application_secrets = derive_next_application_secrets(
+            self.application_secrets, debug=self.debug
+        )
+        
+        # Save current keys as previous (for decrypting in-flight packets)
+        self._previous_application_secrets = self.application_secrets
+        
+        # Switch to new keys for sending
+        self.application_secrets = self._next_application_secrets
+        self._next_application_secrets = None
+        
+        # Flip the key phase bit
+        self._key_phase = 1 - self._key_phase
+        self._key_update_generation += 1
+        self._key_update_in_progress = True
+        
+        if self.debug:
+            print(f"    🔑 Key Update initiated!")
+            print(f"       Generation: {self._key_update_generation}")
+            print(f"       Key Phase: {self._key_phase}")
+        
+        # Write new keys to keylog file for Wireshark
+        if self.client_random and self.keylog_file:
+            lines = write_keylog(
+                self.keylog_file, self.client_random,
+                client_traffic_secret=self.application_secrets["client"]["traffic_secret"],
+                server_traffic_secret=self.application_secrets["server"]["traffic_secret"]
+            )
+            if self.debug:
+                print(f"    📝 Updated keys written to {self.keylog_file}")
+        
+        return True
+    
+    def _complete_key_update(self):
+        """
+        Complete the Key Update after receiving a packet with the new key phase.
+        
+        This is called when we receive a packet encrypted with our new keys,
+        confirming the peer has received and can decrypt our key-updated packets.
+        """
+        if not self._key_update_in_progress:
+            return
+        
+        # Discard previous keys - peer has confirmed receipt of new keys
+        self._previous_application_secrets = None
+        self._key_update_in_progress = False
+        self._key_update_received_pn = None
+        
+        if self.debug:
+            print(f"    ✅ Key Update complete (generation {self._key_update_generation})")
+    
+    def _handle_peer_key_update(self, received_key_phase: int):
+        """
+        Handle a Key Update initiated by the peer.
+        
+        When we receive a packet with a different key phase than expected,
+        we need to update our decryption keys and prepare to send with new keys.
+        
+        Args:
+            received_key_phase: The key phase bit from the received packet
+        """
+        if received_key_phase == self._key_phase:
+            return  # No change needed
+        
+        if self.debug:
+            print(f"    🔑 Peer initiated Key Update (phase: {self._key_phase} → {received_key_phase})")
+        
+        # Save current keys as previous
+        self._previous_application_secrets = self.application_secrets
+        
+        # Derive next secrets for decryption
+        next_secrets = derive_next_application_secrets(
+            self.application_secrets, debug=self.debug
+        )
+        
+        # Update our keys to match peer
+        self.application_secrets = next_secrets
+        self._key_phase = received_key_phase
+        self._key_update_generation += 1
+        
+        # Write updated keys to keylog
+        if self.client_random and self.keylog_file:
+            write_keylog(
+                self.keylog_file, self.client_random,
+                client_traffic_secret=self.application_secrets["client"]["traffic_secret"],
+                server_traffic_secret=self.application_secrets["server"]["traffic_secret"]
+            )
+        
+        if self.debug:
+            print(f"    ✅ Keys updated to generation {self._key_update_generation}")
+    
+    def get_key_update_stats(self) -> dict:
+        """
+        Get current Key Update statistics.
+        
+        Returns:
+            dict: Key update state information
+        """
+        return {
+            "key_phase": self._key_phase,
+            "generation": self._key_update_generation,
+            "update_in_progress": self._key_update_in_progress,
+            "has_previous_keys": self._previous_application_secrets is not None,
+        }
+    
     def _build_h3_init_packet_with_frames(self) -> tuple:
         """
         Build 1-RTT packet containing HTTP/3 initialization streams.
@@ -1673,7 +1820,11 @@ class RealtimeQUICClient:
                 traceback.print_exc()
     
     def _process_1rtt_packet(self, packet: bytes, recv_time: float = None) -> bool:
-        """Process a received 1-RTT (Short Header) packet."""
+        """
+        Process a received 1-RTT (Short Header) packet.
+        
+        Handles Key Phase detection for Key Update (RFC 9001 Section 6).
+        """
         if not self.application_secrets:
             if self.debug:
                 print(f"      ⚠️ Cannot process 1-RTT packet: no application secrets")
@@ -1698,49 +1849,120 @@ class RealtimeQUICClient:
                 return False
             
             sample = packet[sample_offset:sample_offset + 16]
-            hp_key = self.application_secrets["server"]["hp"]
             
-            cipher = Cipher(algorithms.AES(hp_key), modes.ECB())
-            encryptor = cipher.encryptor()
-            mask = encryptor.update(sample) + encryptor.finalize()
+            # Try decryption with current keys first, then handle Key Update scenarios
+            secrets_to_try = [
+                (self.application_secrets, "current", self._key_phase),
+            ]
             
-            decrypted_first_byte = first_byte ^ (mask[0] & 0x1f)
-            pn_length = (decrypted_first_byte & 0x03) + 1
+            # If a key update is in progress, also try with previous keys
+            if self._previous_application_secrets:
+                secrets_to_try.append(
+                    (self._previous_application_secrets, "previous", 1 - self._key_phase)
+                )
             
-            pn_bytes = bytearray(packet[pn_offset:pn_offset + pn_length])
-            for i in range(pn_length):
-                pn_bytes[i] ^= mask[1 + i]
+            plaintext = None
+            used_secrets = None
+            received_key_phase = None
+            decrypted_first_byte = None
+            pn = None
+            header = None
             
-            # Decode truncated PN from wire
-            truncated_pn = 0
-            for b in pn_bytes:
-                truncated_pn = (truncated_pn << 8) | b
+            for secrets, secrets_name, expected_phase in secrets_to_try:
+                hp_key = secrets["server"]["hp"]
+                
+                cipher = Cipher(algorithms.AES(hp_key), modes.ECB())
+                encryptor = cipher.encryptor()
+                mask = encryptor.update(sample) + encryptor.finalize()
+                
+                decrypted_first_byte = first_byte ^ (mask[0] & 0x1f)
+                pn_length = (decrypted_first_byte & 0x03) + 1
+                
+                # Extract Key Phase from decrypted first byte
+                received_key_phase = (decrypted_first_byte >> 2) & 0x01
+                
+                pn_bytes = bytearray(packet[pn_offset:pn_offset + pn_length])
+                for i in range(pn_length):
+                    pn_bytes[i] ^= mask[1 + i]
+                
+                # Decode truncated PN from wire
+                truncated_pn = 0
+                for b in pn_bytes:
+                    truncated_pn = (truncated_pn << 8) | b
+                
+                # Reconstruct full packet number (RFC 9000 Appendix A.3)
+                pn = decode_packet_number(
+                    self.app_tracker.largest_pn,
+                    truncated_pn,
+                    pn_length * 8
+                )
+                
+                # Header uses truncated PN bytes from wire (for AEAD additional data)
+                header = bytes([decrypted_first_byte]) + packet[1:pn_offset] + bytes(pn_bytes)
+                
+                encrypted_payload = packet[pn_offset + pn_length:]
+                plaintext = decrypt_payload(secrets["server"], pn, header, encrypted_payload)
+                
+                if plaintext is not None:
+                    used_secrets = secrets_name
+                    break
             
-            # Reconstruct full packet number (RFC 9000 Appendix A.3)
-            pn = decode_packet_number(
-                self.app_tracker.largest_pn,
-                truncated_pn,
-                pn_length * 8
-            )
+            if plaintext is None:
+                # Neither current nor previous keys worked - maybe peer initiated key update
+                # Try deriving and using next keys
+                if received_key_phase is not None and received_key_phase != self._key_phase:
+                    next_secrets = derive_next_application_secrets(
+                        self.application_secrets, debug=False
+                    )
+                    
+                    hp_key = next_secrets["server"]["hp"]
+                    cipher = Cipher(algorithms.AES(hp_key), modes.ECB())
+                    encryptor = cipher.encryptor()
+                    mask = encryptor.update(sample) + encryptor.finalize()
+                    
+                    decrypted_first_byte = first_byte ^ (mask[0] & 0x1f)
+                    pn_length = (decrypted_first_byte & 0x03) + 1
+                    
+                    pn_bytes = bytearray(packet[pn_offset:pn_offset + pn_length])
+                    for i in range(pn_length):
+                        pn_bytes[i] ^= mask[1 + i]
+                    
+                    truncated_pn = 0
+                    for b in pn_bytes:
+                        truncated_pn = (truncated_pn << 8) | b
+                    
+                    pn = decode_packet_number(
+                        self.app_tracker.largest_pn,
+                        truncated_pn,
+                        pn_length * 8
+                    )
+                    
+                    header = bytes([decrypted_first_byte]) + packet[1:pn_offset] + bytes(pn_bytes)
+                    encrypted_payload = packet[pn_offset + pn_length:]
+                    plaintext = decrypt_payload(next_secrets["server"], pn, header, encrypted_payload)
+                    
+                    if plaintext is not None:
+                        # Peer initiated key update - handle it
+                        self._handle_peer_key_update(received_key_phase)
+                        used_secrets = "next (peer key update)"
             
-            # Header uses truncated PN bytes from wire (for AEAD additional data)
-            header = bytes([decrypted_first_byte]) + packet[1:pn_offset] + bytes(pn_bytes)
+            if plaintext is None:
+                if self.debug:
+                    print(f"      ❌ 1-RTT decryption failed PN={pn}, key_phase={received_key_phase}")
+                return False
             
             if pn in self.app_tracker.received_pns:
                 if self.debug:
                     print(f"      ⚠️ Duplicate 1-RTT packet PN={pn}, ignoring")
                 return True
             
-            encrypted_payload = packet[pn_offset + pn_length:]
-            plaintext = decrypt_payload(self.application_secrets["server"], pn, header, encrypted_payload)
-            
-            if plaintext is None:
-                if self.debug:
-                    print(f"      ❌ 1-RTT decryption failed PN={pn}")
-                return False
-            
             if self.debug:
-                print(f"      ✓ 1-RTT decrypted PN={pn}, payload {len(plaintext)} bytes")
+                key_info = f", key_phase={received_key_phase}" if received_key_phase != self._key_phase else ""
+                print(f"      ✓ 1-RTT decrypted PN={pn}, payload {len(plaintext)} bytes{key_info}")
+            
+            # If we initiated key update and received packet with new phase, complete the update
+            if self._key_update_in_progress and received_key_phase == self._key_phase:
+                self._complete_key_update()
             
             ack_eliciting = self._parse_1rtt_frames(plaintext)
             
@@ -2483,7 +2705,17 @@ class RealtimeQUICClient:
             print(f"    → Sent 1-RTT ACK (PN={self.client_app_pn - 1}, largest={self.app_tracker.largest_pn})")
     
     def _build_short_header_packet(self, dcid: bytes, pn: int, payload: bytes) -> bytes:
-        """Build a Short Header (1-RTT) packet."""
+        """
+        Build a Short Header (1-RTT) packet.
+        
+        Short Header format (RFC 9000 Section 17.3):
+        - Bit 7 (0x80): Header Form = 0 (Short)
+        - Bit 6 (0x40): Fixed Bit = 1
+        - Bit 5 (0x20): Spin Bit
+        - Bits 4-3 (0x18): Reserved Bits
+        - Bit 2 (0x04): Key Phase
+        - Bits 1-0 (0x03): Packet Number Length
+        """
         # Determine packet number length
         if pn < 0x100:
             pn_len = 1
@@ -2498,8 +2730,9 @@ class RealtimeQUICClient:
             pn_len = 4
             pn_bytes = struct.pack(">I", pn)
         
-        # Short header first byte
-        first_byte = 0x40 | (pn_len - 1)
+        # Short header first byte with Key Phase bit
+        # 0x40 = Fixed Bit, 0x04 = Key Phase bit (when key_phase = 1)
+        first_byte = 0x40 | (pn_len - 1) | (self._key_phase << 2)
         
         # Build header (unprotected)
         header = bytes([first_byte]) + dcid + pn_bytes
