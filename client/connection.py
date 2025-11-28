@@ -155,6 +155,10 @@ class RealtimeQUICClient:
         # Alternative connection IDs
         self.alt_connection_ids = []
         
+        # Server's stateless reset tokens (for detecting Stateless Reset packets)
+        # Maps: stateless_reset_token (bytes) -> connection_id (bytes)
+        self.peer_stateless_reset_tokens: dict[bytes, bytes] = {}
+        
         # Session tickets for 0-RTT
         self.session_tickets = []
         self.resumption_master_secret = None
@@ -180,6 +184,9 @@ class RealtimeQUICClient:
         # Key discard flags (to avoid using discarded keys)
         self._initial_keys_discarded: bool = False
         self._handshake_keys_discarded: bool = False
+        
+        # Stateless reset flag
+        self._stateless_reset_received: bool = False
         
         # PTO timer task
         self._pto_timer_task: Optional[asyncio.Task] = None
@@ -554,6 +561,67 @@ class RealtimeQUICClient:
             ack_eliciting=ack_eliciting,
             frames=frames
         )
+    
+    def _is_stateless_reset(self, data: bytes) -> bool:
+        """
+        Check if a received packet is a Stateless Reset.
+        
+        Per RFC 9000 Section 10.3:
+        - Stateless Reset packets have the form: Fixed Bits (01) + Random + Token (16 bytes)
+        - The last 16 bytes of the packet must match a known stateless reset token
+        - Minimum packet size is 21 bytes (to be indistinguishable from other packets)
+        
+        Args:
+            data: The received UDP datagram
+            
+        Returns:
+            True if this is a Stateless Reset packet
+        """
+        # Stateless Reset must be at least 21 bytes (RFC 9000 Section 10.3)
+        if len(data) < 21:
+            return False
+        
+        # Check if we have any known stateless reset tokens
+        if not self.peer_stateless_reset_tokens:
+            return False
+        
+        # Extract the last 16 bytes as potential stateless reset token
+        potential_token = data[-16:]
+        
+        # Check if it matches any known token
+        if potential_token in self.peer_stateless_reset_tokens:
+            return True
+        
+        return False
+    
+    def _handle_stateless_reset(self, data: bytes):
+        """
+        Handle a detected Stateless Reset packet.
+        
+        Per RFC 9000 Section 10.3.1:
+        - When a Stateless Reset is detected, the connection must be closed immediately
+        - No further packets should be sent on this connection
+        - This indicates the peer has lost all connection state
+        
+        Args:
+            data: The Stateless Reset packet
+        """
+        token = data[-16:]
+        associated_cid = self.peer_stateless_reset_tokens.get(token, b"")
+        
+        if self.debug:
+            print(f"\n    ⚡ STATELESS RESET detected!")
+            print(f"       Token: {token.hex()}")
+            if associated_cid:
+                print(f"       Associated CID: {associated_cid.hex()}")
+            print(f"       Connection will be closed immediately")
+        
+        # Mark connection as closed due to stateless reset
+        self.state = HandshakeState.FAILED
+        self.connection_closed.set()
+        
+        # Set a flag to indicate this was a stateless reset (not a normal close)
+        self._stateless_reset_received = True
     
     def _discard_initial_keys(self):
         """
@@ -1711,10 +1779,12 @@ class RealtimeQUICClient:
                 offset += 1
                 cid = payload[offset:offset + cid_len]
                 offset += cid_len
-                stateless_reset = payload[offset:offset + 16]
+                stateless_reset_token = payload[offset:offset + 16]
                 offset += 16
+                # Store server's stateless reset token for detecting Stateless Reset packets
+                self.peer_stateless_reset_tokens[stateless_reset_token] = cid
                 if self.debug:
-                    print(f"        NEW_CONNECTION_ID: seq={seq_num}, cid={cid.hex()[:16]}...")
+                    print(f"        NEW_CONNECTION_ID: seq={seq_num}, cid={cid.hex()[:16]}..., reset_token={stateless_reset_token.hex()[:16]}...")
             elif frame_type == 0x07:  # NEW_TOKEN
                 ack_eliciting = True
                 token_length, consumed = decode_varint(payload, offset)
@@ -2253,7 +2323,14 @@ class RealtimeQUICClient:
             if not (first_byte & 0x80):
                 # Validate Short Header format: Fixed Bit must be 1 (RFC 9000 Section 17.3)
                 if not (first_byte & 0x40):
-                    # Not a valid Short Header (could be padding or other data)
+                    # Not a valid Short Header - could be Stateless Reset (RFC 9000 Section 10.3)
+                    # Stateless Reset has form: Fixed Bits (01) + Unpredictable Bits + Token (16 bytes)
+                    # But the first bit is 0, so check for Stateless Reset first
+                    if self._is_stateless_reset(data):
+                        self._handle_stateless_reset(data)
+                        return
+                    
+                    # Not a Stateless Reset, just invalid data
                     if self.debug and first_byte != 0x00:  # Don't spam for PADDING
                         print(f"      ⚠️ Invalid Short Header first byte: 0x{first_byte:02x}, skipping remaining {len(remaining)} bytes")
                     break
@@ -2268,7 +2345,12 @@ class RealtimeQUICClient:
                 
                 if self.debug:
                     print(f"    📦 [#{self.packets_received}.{packet_in_datagram}] Short Header (1-RTT)")
-                self._process_1rtt_packet(remaining, recv_time)
+                success = self._process_1rtt_packet(remaining, recv_time)
+                
+                # If 1-RTT processing failed, check for Stateless Reset
+                if not success and self._is_stateless_reset(data):
+                    self._handle_stateless_reset(data)
+                    return
                 break
             
             # Parse Long header
