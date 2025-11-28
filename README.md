@@ -261,6 +261,103 @@ python main.py api.tenclass.net -s session.json
 python main.py api.tenclass.net -s session.json
 ```
 
+### 运行示例
+
+以下是一个完整的运行示例，展示访问 www.taobao.com 的 HTTP/3 请求：
+
+```bash
+$ python main.py www.taobao.com --path / -q
+HTTP/3 Client - Keys will be written to quic_keys.log (Wireshark SSLKEYLOGFILE format)
+Mode: SINGLE REQUEST
+Target: https://www.taobao.com:443/
+Press Ctrl+C to exit
+
+============================================================
+HTTP/3 Client
+============================================================
+    Key log file: quic_keys.log
+
+[1] Connecting to www.taobao.com:443...
+
+[2] Starting QUIC handshake...
+
+[3] Handshake result: SUCCESS ✅
+
+    === Handshake Summary ===
+    Initial packets received: 1
+    Handshake packets received: 5
+    Initial CRYPTO: 90 bytes
+    Handshake CRYPTO: 5566 bytes
+
+[4] Sending HTTP/3 GET request to /...
+----------------------------------------
+
+[5] HTTP/3 Response:
+----------------------------------------
+
+    === Response for / ===
+    Status: 200
+
+    Headers:
+      :status: 200
+      timing-allow-origin: Tengine
+      content-type: text/html; charset=utf-8
+      vary: accept-encoding
+      date: Fri, 01 Jan 2025 12:00:00 GMT
+      vary: Accept-Encoding
+      x-server-id: xxx...
+      x-air-hostname: xxx...
+      x-air-trace-id: xxx...
+      cache-control: max-age=0, s-maxage=139
+      x-node: xxx...
+      x-eagleeye-id: xxx...
+      x-wh-action: crossEngineRewrite
+      x-retmsg: ok
+      x-content-type: text/html; charset=utf-8
+      vary: Ali-Detector-Type, X-Host, x-accept-terminal, x-document-bundle, Accept-Encoding, Origin
+      streaming-parser: open
+      x-retcode: SUCCESS
+      etag: W/"xxx..."
+      x-readtime: 367
+      x-via: xxx...
+      x-air-source: proxy
+      x-xss-protection: 1; mode=block
+      ups-target-key: xxx...
+      x-protocol: HTTP/1.1
+      eagleeye-traceid: xxx...
+      strict-transport-security: max-age=31536000
+      s-brt: 368
+      s-rt: 370
+      via: xxx...
+      age: 77
+      ali-swift-global-savetime: xxx...
+      x-cache: HIT TCP_MEM_HIT dirn:-2:-2
+      x-swift-savetime: Fri, 01 Jan 2025 12:00:00 GMT
+      x-swift-cachetime: 139
+      x-air-pt: pt0
+      timing-allow-origin: *
+      eagleid: xxx...
+
+    Body (90674 bytes):
+      
+
+<!DOCTYPE html><html lang="zh-CN"><head><meta charSet="utf-8"/><meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1"/><meta name="renderer" content="webkit"/><meta name="viewport" content="width=1200"/><meta name="ice-meta-count" content="0"/><title>淘宝</title><meta name="description" content="淘宝网 - 亚洲较大的网上交易平台，提供各类服饰、美容、家居、数码、话费/点卡充值… 数亿优质商品，同时提供担保交易(先收货后付款)等安全交易保障服务，并由商家提供退货承诺、破损补寄等消费者保障服务，让你安心享受网上购物乐趣！"/><meta name="keywords" content="淘宝,掏宝,网上购物,C2C,在线交易,交易市场,网上交易,交易市场,网上买,网上卖,购物网站
+      ... (86303 more bytes)
+
+[7] Closing connection...
+----------------------------------------
+
+    === Final Statistics ===
+    UDP packets received: 77
+    Bytes received: 100876
+    Packets sent: 83
+    Initial packets: 1
+    Handshake packets: 5
+    1-RTT packets: 72
+
+============================================================
+```
+
 ### 代码示例
 
 ```python
