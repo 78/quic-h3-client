@@ -248,6 +248,7 @@ def parse_qpack_encoder_instructions(data: bytes, dynamic_table: QPACKDynamicTab
     
     while offset < len(data):
         byte = data[offset]
+        start_offset = offset  # Track start to detect no progress
         
         if byte & 0x80:
             # Insert With Name Reference: 1Txxxxxx
@@ -256,13 +257,21 @@ def parse_qpack_encoder_instructions(data: bytes, dynamic_table: QPACKDynamicTab
             
             # Index with 6-bit prefix
             index, consumed = _decode_qpack_int(data, offset, 6)
+            if consumed == 0:
+                break  # Incomplete data
             offset += consumed
             
             # Value string
             value, consumed = _decode_qpack_string(data, offset)
+            if consumed == 0:
+                break  # Incomplete data
             offset += consumed
             
-            dynamic_table.insert_with_name_reference(index, is_static, value)
+            res = dynamic_table.insert_with_name_reference(index, is_static, value)
+            if res == -1:
+                if debug:
+                    print(f"    ⚠️ QPACK: Failed to insert with name reference (invalid index/size)")
+                raise ValueError("QPACK corruption: Invalid insert with name reference")
             
             if debug:
                 table_type = "static" if is_static else "dynamic"
@@ -274,13 +283,21 @@ def parse_qpack_encoder_instructions(data: bytes, dynamic_table: QPACKDynamicTab
             
             # Name string (5-bit prefix for length, but first bit is H flag)
             name, consumed = _decode_qpack_string_with_prefix(data, offset, 5)
+            if consumed == 0:
+                break  # Incomplete data
             offset += consumed
             
             # Value string
             value, consumed = _decode_qpack_string(data, offset)
+            if consumed == 0:
+                break  # Incomplete data
             offset += consumed
             
-            dynamic_table.insert(name, value)
+            res = dynamic_table.insert(name, value)
+            if res == -1:
+                if debug:
+                    print(f"    ⚠️ QPACK: Failed to insert literal (invalid size)")
+                raise ValueError("QPACK corruption: Invalid insert literal")
             
             if debug:
                 print(f"    📝 QPACK Encoder: Insert literal '{name}' = '{value[:50]}'")
@@ -288,6 +305,8 @@ def parse_qpack_encoder_instructions(data: bytes, dynamic_table: QPACKDynamicTab
         elif byte & 0x20:
             # Set Dynamic Table Capacity: 001xxxxx
             capacity, consumed = _decode_qpack_int(data, offset, 5)
+            if consumed == 0:
+                break  # Incomplete data
             offset += consumed
             
             dynamic_table.set_capacity(capacity)
@@ -298,12 +317,22 @@ def parse_qpack_encoder_instructions(data: bytes, dynamic_table: QPACKDynamicTab
         else:
             # Duplicate: 000xxxxx
             index, consumed = _decode_qpack_int(data, offset, 5)
+            if consumed == 0:
+                break  # Incomplete data
             offset += consumed
             
-            dynamic_table.duplicate(index)
+            res = dynamic_table.duplicate(index)
+            if res == -1:
+                if debug:
+                    print(f"    ⚠️ QPACK: Failed to duplicate (invalid index)")
+                raise ValueError("QPACK corruption: Invalid duplicate")
             
             if debug:
                 print(f"    📝 QPACK Encoder: Duplicate entry[{index}]")
+        
+        # Safety check: ensure progress was made
+        if offset == start_offset:
+            break
     
     return offset
 
@@ -313,7 +342,7 @@ def _decode_qpack_int(data: bytes, offset: int, prefix_bits: int) -> tuple:
     Decode QPACK integer encoding (RFC 9204 Section 4.1.1).
     
     Returns:
-        tuple: (value, bytes_consumed)
+        tuple: (value, bytes_consumed) - returns (0, 0) if data is incomplete
     """
     if offset >= len(data):
         return 0, 0
@@ -327,13 +356,20 @@ def _decode_qpack_int(data: bytes, offset: int, prefix_bits: int) -> tuple:
     
     # Multi-byte encoding
     shift = 0
+    complete = False
     while offset + consumed < len(data):
         byte = data[offset + consumed]
         value += (byte & 0x7f) << shift
         consumed += 1
         if not (byte & 0x80):
+            # Last byte of multi-byte sequence (MSB is 0)
+            complete = True
             break
         shift += 7
+    
+    # If we exited the loop without finding the last byte, data is incomplete
+    if not complete:
+        return 0, 0
     
     return value, consumed
 

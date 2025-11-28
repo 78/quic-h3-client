@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from quic.constants import QUIC_VERSION
-from quic.varint import encode_varint, decode_varint
+from quic.varint import encode_varint, decode_varint, decode_packet_number
 from quic.crypto import (
     derive_initial_secrets, derive_server_initial_secrets,
     derive_handshake_secrets, derive_application_secrets,
@@ -1029,9 +1029,9 @@ class RealtimeQUICClient:
         })
         
         # 3. STREAM frame for QPACK Encoder stream (id=6)
-        # Pass QPACK_MAX_TABLE_CAPACITY from settings
-        qpack_max_table_capacity = self.h3_settings.get(0x01, 4096)
-        encoder_stream_data = build_h3_qpack_encoder_stream_data(qpack_max_table_capacity)
+        # Note: Don't send Set Dynamic Table Capacity here - we haven't received
+        # server's SETTINGS yet. Just send the stream type byte.
+        encoder_stream_data = build_h3_qpack_encoder_stream_data()
         encoder_stream_frame = build_stream_frame(
             stream_id=self.h3_local_encoder_stream_id,
             data=encoder_stream_data,
@@ -1189,8 +1189,16 @@ class RealtimeQUICClient:
                 print(f"    📝 Server SCID: {self.server_scid.hex()}")
         
         try:
-            header, pn, pn_len = remove_header_protection(
+            header, truncated_pn, pn_len = remove_header_protection(
                 self.server_initial_secrets, packet, header_info["pn_offset"]
+            )
+            
+            # Reconstruct full packet number (RFC 9000 Appendix A.3)
+            # Note: header keeps truncated PN bytes for AEAD, full PN used for nonce
+            pn = decode_packet_number(
+                self.initial_tracker.largest_pn,
+                truncated_pn,
+                pn_len * 8
             )
             
             # Check for duplicate
@@ -1237,8 +1245,16 @@ class RealtimeQUICClient:
             return False
         
         try:
-            header, pn, pn_len = remove_header_protection(
+            header, truncated_pn, pn_len = remove_header_protection(
                 self.handshake_secrets["server"], packet, header_info["pn_offset"]
+            )
+            
+            # Reconstruct full packet number (RFC 9000 Appendix A.3)
+            # Note: header keeps truncated PN bytes for AEAD, full PN used for nonce
+            pn = decode_packet_number(
+                self.handshake_tracker.largest_pn,
+                truncated_pn,
+                pn_len * 8
             )
             
             # Check for duplicate
@@ -1295,8 +1311,61 @@ class RealtimeQUICClient:
             elif frame["type"] == "PADDING":
                 pass
             elif frame["type"] == "CONNECTION_CLOSE":
+                error_code = frame.get('error_code', 'unknown')
+                reason = frame.get('reason', '')
+                # Map common QUIC error codes
+                error_names = {
+                    0x00: "NO_ERROR",
+                    0x01: "INTERNAL_ERROR", 
+                    0x02: "CONNECTION_REFUSED",
+                    0x03: "FLOW_CONTROL_ERROR",
+                    0x04: "STREAM_LIMIT_ERROR",
+                    0x05: "STREAM_STATE_ERROR",
+                    0x06: "FINAL_SIZE_ERROR",
+                    0x07: "FRAME_ENCODING_ERROR",
+                    0x08: "TRANSPORT_PARAMETER_ERROR",
+                    0x09: "CONNECTION_ID_LIMIT_ERROR",
+                    0x0a: "PROTOCOL_VIOLATION",
+                    0x0b: "INVALID_TOKEN",
+                    0x0c: "APPLICATION_ERROR",
+                    0x0d: "CRYPTO_BUFFER_EXCEEDED",
+                    0x0e: "KEY_UPDATE_ERROR",
+                    0x0f: "AEAD_LIMIT_REACHED",
+                    0x10: "NO_VIABLE_PATH",
+                }
+                # TLS alert codes (0x100 + TLS alert)
+                tls_alerts = {
+                    0x100 + 10: "TLS_UNEXPECTED_MESSAGE",
+                    0x100 + 20: "TLS_BAD_RECORD_MAC",
+                    0x100 + 40: "TLS_HANDSHAKE_FAILURE",
+                    0x100 + 42: "TLS_BAD_CERTIFICATE",
+                    0x100 + 43: "TLS_UNSUPPORTED_CERTIFICATE",
+                    0x100 + 44: "TLS_CERTIFICATE_REVOKED",
+                    0x100 + 45: "TLS_CERTIFICATE_EXPIRED",
+                    0x100 + 46: "TLS_CERTIFICATE_UNKNOWN",
+                    0x100 + 47: "TLS_ILLEGAL_PARAMETER",
+                    0x100 + 48: "TLS_UNKNOWN_CA",
+                    0x100 + 50: "TLS_DECODE_ERROR",
+                    0x100 + 51: "TLS_DECRYPT_ERROR",
+                    0x100 + 70: "TLS_PROTOCOL_VERSION",
+                    0x100 + 71: "TLS_INSUFFICIENT_SECURITY",
+                    0x100 + 80: "TLS_INTERNAL_ERROR",
+                    0x100 + 86: "TLS_INAPPROPRIATE_FALLBACK",
+                    0x100 + 109: "TLS_MISSING_EXTENSION",
+                    0x100 + 110: "TLS_UNSUPPORTED_EXTENSION",
+                    0x100 + 112: "TLS_UNRECOGNIZED_NAME",
+                    0x100 + 120: "TLS_NO_APPLICATION_PROTOCOL",
+                }
+                error_names.update(tls_alerts)
+                error_name = error_names.get(error_code, f"0x{error_code:02x}" if isinstance(error_code, int) else str(error_code))
+                # Add helpful hint for common errors
+                hint = ""
+                if error_code == 0x128:  # TLS handshake_failure
+                    hint = " (server may not support HTTP/3)"
+                elif error_code == 0x178:  # TLS no_application_protocol
+                    hint = " (server doesn't support h3 ALPN)"
                 if self.debug:
-                    print(f"      ❌ CONNECTION_CLOSE: {frame.get('reason', 'unknown')}")
+                    print(f"      ❌ CONNECTION_CLOSE: {error_name} (code={error_code}){hint}")
                 self.state = HandshakeState.FAILED
                 self.connection_closed.set()
             else:
@@ -1367,6 +1436,11 @@ class RealtimeQUICClient:
     def _parse_handshake_crypto(self):
         """Parse Handshake CRYPTO data (looking for Finished)."""
         data = self.handshake_crypto_buffer.get_contiguous_data()
+        total_received = self.handshake_crypto_buffer.total_received
+        
+        if self.debug:
+            print(f"      📊 Handshake CRYPTO: contiguous={len(data)}, total_received={total_received}, parsed_offset={self.handshake_crypto_parsed_offset}")
+        
         if len(data) < 4:
             return
         
@@ -1375,6 +1449,10 @@ class RealtimeQUICClient:
         
         try:
             messages = parse_tls_handshake(data, False)
+            
+            if self.debug:
+                print(f"      📊 Parsed {len(messages)} TLS message(s)")
+            
             offset = 0
             for msg in messages:
                 msg_end = offset + 4 + msg["length"]
@@ -1427,7 +1505,10 @@ class RealtimeQUICClient:
             self.handshake_crypto_parsed_offset = len(data)
                     
         except Exception as e:
-            pass
+            if self.debug:
+                import traceback
+                print(f"      ❌ Parse Handshake CRYPTO failed: {e}")
+                traceback.print_exc()
     
     def _process_1rtt_packet(self, packet: bytes, recv_time: float = None) -> bool:
         """Process a received 1-RTT (Short Header) packet."""
@@ -1468,10 +1549,19 @@ class RealtimeQUICClient:
             for i in range(pn_length):
                 pn_bytes[i] ^= mask[1 + i]
             
-            pn = 0
+            # Decode truncated PN from wire
+            truncated_pn = 0
             for b in pn_bytes:
-                pn = (pn << 8) | b
+                truncated_pn = (truncated_pn << 8) | b
             
+            # Reconstruct full packet number (RFC 9000 Appendix A.3)
+            pn = decode_packet_number(
+                self.app_tracker.largest_pn,
+                truncated_pn,
+                pn_length * 8
+            )
+            
+            # Header uses truncated PN bytes from wire (for AEAD additional data)
             header = bytes([decrypted_first_byte]) + packet[1:pn_offset] + bytes(pn_bytes)
             
             if pn in self.app_tracker.received_pns:

@@ -259,29 +259,41 @@ class H3StreamManager:
         
         # Parse encoder instructions
         prev_insert_count = self.qpack_dynamic_table.insert_count
-        consumed = parse_qpack_encoder_instructions(
-            encoder_data, 
-            self.qpack_dynamic_table, 
-            debug=debug
-        )
-        self._encoder_stream_parsed_offset += consumed
-        
-        # If new entries were inserted, send Insert Count Increment
-        new_inserts = self.qpack_dynamic_table.insert_count - prev_insert_count
-        if new_inserts > 0:
-            self._pending_decoder_instructions.extend(
-                build_insert_count_increment(new_inserts)
+        try:
+            consumed = parse_qpack_encoder_instructions(
+                encoder_data, 
+                self.qpack_dynamic_table, 
+                debug=debug
             )
+            self._encoder_stream_parsed_offset += consumed
             
-            results.append({
-                "type": "qpack_table_updated",
-                "new_entries": new_inserts,
-                "total_entries": len(self.qpack_dynamic_table),
-                "table_size": self.qpack_dynamic_table.size,
-            })
-            
+            # If new entries were inserted, send Insert Count Increment
+            new_inserts = self.qpack_dynamic_table.insert_count - prev_insert_count
+            if new_inserts > 0:
+                self._pending_decoder_instructions.extend(
+                    build_insert_count_increment(new_inserts)
+                )
+                
+                results.append({
+                    "type": "qpack_table_updated",
+                    "new_entries": new_inserts,
+                    "total_entries": len(self.qpack_dynamic_table),
+                    "table_size": self.qpack_dynamic_table.size,
+                })
+                
+                if debug:
+                    print(f"    📊 QPACK dynamic table: {len(self.qpack_dynamic_table)} entries, {self.qpack_dynamic_table.size} bytes")
+        except ValueError as e:
             if debug:
-                print(f"    📊 QPACK dynamic table: {len(self.qpack_dynamic_table)} entries, {self.qpack_dynamic_table.size} bytes")
+                print(f"    ⚠️ QPACK Encoder Stream Error: {e}")
+                print(f"    🛑 Stopping processing of QPACK encoder stream to prevent invalid state.")
+            # We stop processing this batch. The stream is likely desynchronized.
+            # We do NOT increment _encoder_stream_parsed_offset, so we might retry (and fail again) 
+            # or we could increment to skip? 
+            # Skipping is dangerous as we don't know where the next instruction starts.
+            # By not incrementing, we effectively stall the encoder stream processing.
+            # This prevents sending invalid increments.
+            pass
     
     def _process_request_stream_response(self, stream_id: int, stream: dict, 
                                          fin: bool, debug: bool, results: list):

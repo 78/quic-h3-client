@@ -230,29 +230,35 @@ def build_qpack_set_dynamic_table_capacity(capacity: int) -> bytes:
     return bytes(result)
 
 
-def build_h3_qpack_encoder_stream_data(max_table_capacity: int = 4096) -> bytes:
+def build_h3_qpack_encoder_stream_data(max_table_capacity: int = 0) -> bytes:
     """
     Build QPACK encoder stream data.
     
     Encoder stream data format:
     1. Stream type (varint): 0x02 for QPACK encoder
-    2. Set Dynamic Table Capacity instruction (if capacity > 0)
+    2. Set Dynamic Table Capacity instruction (optional)
     
-    According to RFC 9204, if QPACK_MAX_TABLE_CAPACITY > 0 is advertised
-    in SETTINGS, the encoder MUST send a Set Dynamic Table Capacity
-    instruction on the encoder stream.
+    According to RFC 9204 Section 2.1.2:
+    - The encoder MUST NOT send a Set Dynamic Table Capacity that exceeds
+      the decoder's (server's) SETTINGS_QPACK_MAX_TABLE_CAPACITY.
+    - Since we send this BEFORE receiving server's SETTINGS, we should NOT
+      send a Set Dynamic Table Capacity instruction.
+    - For simple clients that don't use dynamic table encoding, just sending
+      the stream type is sufficient.
     
     Args:
-        max_table_capacity: QPACK dynamic table capacity (from SETTINGS)
+        max_table_capacity: QPACK dynamic table capacity (default 0 = don't send)
         
     Returns:
         bytes: Encoder stream initialization data
     """
     data = encode_varint(0x02)  # QPACK Encoder stream type
     
-    # Send Set Dynamic Table Capacity instruction
-    if max_table_capacity > 0:
-        data += build_qpack_set_dynamic_table_capacity(max_table_capacity)
+    # NOTE: Do NOT send Set Dynamic Table Capacity here!
+    # We haven't received server's SETTINGS yet, so we don't know their
+    # QPACK_MAX_TABLE_CAPACITY. Sending a non-zero capacity could cause
+    # QPACK_ENCODER_STREAM_ERROR (0x201) if server's limit is lower.
+    # For a simple client, we use static table + literals for encoding.
     
     return data
 
@@ -506,7 +512,15 @@ def parse_h3_frames(data: bytes, debug: bool = False) -> list:
         payload = data[offset:offset + frame_length]
         offset += frame_length
         
-        frame_type_name = H3_FRAME_TYPE_NAMES.get(frame_type, f"Unknown(0x{frame_type:02x})")
+        # Check if this is a GREASE frame type (0x1f * N + 0x21)
+        is_grease = (frame_type >= 0x21) and ((frame_type - 0x21) % 0x1f == 0)
+        
+        if frame_type in H3_FRAME_TYPE_NAMES:
+            frame_type_name = H3_FRAME_TYPE_NAMES[frame_type]
+        elif is_grease:
+            frame_type_name = f"GREASE(0x{frame_type:x})"
+        else:
+            frame_type_name = f"Extension(0x{frame_type:x})"
         
         frame = {
             "frame_type": frame_type_name,
@@ -515,7 +529,9 @@ def parse_h3_frames(data: bytes, debug: bool = False) -> list:
         }
         
         if debug:
-            print(f"    📦 H3 Frame: {frame_type_name} (type=0x{frame_type:02x}, len={frame_length})")
+            # Don't print GREASE/Extension frames to reduce noise
+            if not (is_grease or frame_type_name.startswith("Extension")):
+                print(f"    📦 H3 Frame: {frame_type_name} (type=0x{frame_type:x}, len={frame_length})")
         
         # Parse specific frame types
         if frame_type == 0x00:  # DATA
@@ -616,7 +632,7 @@ def decode_qpack_int(data: bytes, offset: int, prefix_bits: int) -> tuple:
         prefix_bits: Number of prefix bits
         
     Returns:
-        tuple: (value, bytes_consumed)
+        tuple: (value, bytes_consumed) - returns (0, 0) if data is incomplete
     """
     if offset >= len(data):
         return 0, 0
@@ -630,13 +646,20 @@ def decode_qpack_int(data: bytes, offset: int, prefix_bits: int) -> tuple:
     
     # Multi-byte encoding
     shift = 0
+    complete = False
     while offset + consumed < len(data):
         byte = data[offset + consumed]
         value += (byte & 0x7f) << shift
         consumed += 1
         if not (byte & 0x80):
+            # Last byte of multi-byte sequence (MSB is 0)
+            complete = True
             break
         shift += 7
+    
+    # If we exited the loop without finding the last byte, data is incomplete
+    if not complete:
+        return 0, 0
     
     return value, consumed
 

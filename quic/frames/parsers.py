@@ -117,11 +117,10 @@ def parse_quic_transport_params(data: bytes) -> dict:
     offset = 0
     
     while offset < len(data):
-        if offset >= len(data):
-            break
-            
         # Parameter ID (varint)
         param_id, consumed = decode_varint(data, offset)
+        if consumed == 0:
+            break  # Insufficient data
         offset += consumed
         
         if offset >= len(data):
@@ -129,6 +128,8 @@ def parse_quic_transport_params(data: bytes) -> dict:
             
         # Parameter length (varint)
         param_len, consumed = decode_varint(data, offset)
+        if consumed == 0:
+            break  # Insufficient data
         offset += consumed
         
         if offset + param_len > len(data):
@@ -149,7 +150,10 @@ def parse_quic_transport_params(data: bytes) -> dict:
             params[param_name] = True
         elif param_len > 0:
             # Integer values are encoded as varints within the value field
-            value, _ = decode_varint(param_value, 0)
+            value, value_consumed = decode_varint(param_value, 0)
+            if value_consumed == 0 and len(param_value) > 0:
+                # Fallback: treat as raw integer if varint decode fails
+                value = int.from_bytes(param_value, 'big')
             
             # Add units for specific parameters
             if param_id == 0x01:  # max_idle_timeout
