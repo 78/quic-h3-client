@@ -169,6 +169,14 @@ async def http3_concurrent_requests(hostname: str, port: int, paths: list,
         print(f"    Initial packets: {len(client.initial_tracker.received_pns)}")
         print(f"    Handshake packets: {len(client.handshake_tracker.received_pns)}")
         print(f"    1-RTT packets: {len(client.app_tracker.received_pns)}")
+        
+        # Check if peer closed the connection
+        if client._peer_closed:
+            print(f"\n    ⚠️ Connection closed by peer:")
+            print(f"       Error code: {client._peer_close_error_code}")
+            if client._peer_close_reason:
+                print(f"       Reason: {client._peer_close_reason}")
+        
         client.close()
     
     print("\n" + "=" * 60)
@@ -280,6 +288,14 @@ async def http3_request(hostname: str, port: int, path: str = "/",
         print(f"    1-RTT packets: {len(client.app_tracker.received_pns)}")
         if session_file and client.session_tickets:
             print(f"    Session tickets: {len(client.session_tickets)}")
+        
+        # Check if peer closed the connection
+        if client._peer_closed:
+            print(f"\n    ⚠️ Connection closed by peer:")
+            print(f"       Error code: {client._peer_close_error_code}")
+            if client._peer_close_reason:
+                print(f"       Reason: {client._peer_close_reason}")
+        
         client.close()
     
     print("\n" + "=" * 60)
@@ -374,6 +390,167 @@ async def http3_0rtt_request(hostname: str, port: int, path: str = "/",
         print(f"    0-RTT enabled: {client.zero_rtt_enabled}")
         if client.zero_rtt_enabled:
             print(f"    0-RTT accepted: {client.zero_rtt_accepted}")
+        
+        # Check if peer closed the connection
+        if client._peer_closed:
+            print(f"\n    ⚠️ Connection closed by peer:")
+            print(f"       Error code: {client._peer_close_error_code}")
+            if client._peer_close_reason:
+                print(f"       Reason: {client._peer_close_reason}")
+        
+        client.close()
+    
+    print("\n" + "=" * 60)
+    return client
+
+
+async def http3_chat_stream(hostname: str, port: int, ogg_file: str,
+                           debug: bool = True, keylog_file: str = None,
+                           session_file: str = None):
+    """
+    Test the chat stream API by uploading an OGG audio file.
+    
+    Args:
+        hostname: Target hostname
+        port: Target port
+        ogg_file: Path to the OGG audio file
+        debug: Enable debug output
+        keylog_file: Path to write keys
+        session_file: Path to session file for 0-RTT
+    """
+    print("=" * 60)
+    print("HTTP/3 Chat Stream Test")
+    print("=" * 60)
+    
+    # Read the OGG file
+    import os
+    if not os.path.exists(ogg_file):
+        print(f"    ❌ Error: OGG file not found: {ogg_file}")
+        return None
+    
+    with open(ogg_file, "rb") as f:
+        audio_data = f.read()
+    
+    print(f"    Audio file: {ogg_file}")
+    print(f"    Audio size: {len(audio_data)} bytes")
+    
+    if keylog_file:
+        print(f"    Key log file: {keylog_file}")
+    if session_file:
+        print(f"    Session file: {session_file}")
+    
+    print(f"\n[1] Connecting to {hostname}:{port}...")
+    client = RealtimeQUICClient(hostname, port, debug=debug, keylog_file=keylog_file,
+                                 session_file=session_file)
+    
+    try:
+        await client.connect()
+        
+        print(f"\n[2] Starting QUIC handshake...")
+        success = await client.do_handshake(timeout=5.0)
+        
+        if success:
+            print(f"\n[3] Handshake result: SUCCESS ✅")
+            
+            # Print handshake summary
+            print(f"\n    === Handshake Summary ===")
+            print(f"    Initial packets received: {len(client.initial_tracker.received_pns)}")
+            print(f"    Handshake packets received: {len(client.handshake_tracker.received_pns)}")
+            
+            # Send HTTP/3 POST request using streaming API
+            print(f"\n[4] Sending HTTP/3 POST request to /pocket-sage/chat/stream...")
+            print("-" * 40)
+            
+            import time
+            start_time = time.time()
+            
+            # Open stream and send headers
+            # Note: content-length is optional in HTTP/3
+            # The server knows the body ends when it receives FIN flag (via finish())
+            stream_id = client.open_stream(
+                method="POST",
+                path="/pocket-sage/chat/stream",
+                headers={
+                    "content-type": "application/octet-stream",  # Correct MIME type for OGG audio
+                    # No content-length needed - HTTP/3 uses FIN flag to signal end of body
+                    "x-audio-sample-rate": "16000",
+                    "x-audio-channels": "1",
+                    "x-audio-container": "ogg",
+                    "device-id": "12345",
+                    "accept": "text/plain",  # SSE response expected
+                },
+            )
+            
+            # Write body data in chunks
+            CHUNK_SIZE = 10000  # 10KB per write (conservative for flow control)
+            offset = 0
+            while offset < len(audio_data):
+                chunk = audio_data[offset:offset + CHUNK_SIZE]
+                await client.write(stream_id, chunk)
+                offset += len(chunk)
+                if debug:
+                    progress = offset * 100 // len(audio_data)
+                    print(f"      Upload progress: {progress}%")
+            
+            # Finish the stream
+            await client.finish(stream_id)
+            
+            upload_time = time.time() - start_time
+            if debug:
+                print(f"      Upload completed in {upload_time:.3f}s")
+            
+            # Wait for response
+            response = await client.read_response(stream_id, timeout=60.0)
+            
+            elapsed = time.time() - start_time
+            
+            # Print response
+            print(f"\n[5] HTTP/3 Response (completed in {elapsed:.3f}s):")
+            print("-" * 40)
+            print_response("/pocket-sage/chat/stream", response)
+            
+            # Print special headers if present
+            if response.get("headers"):
+                for name, value in response["headers"]:
+                    if name.startswith("x-"):
+                        if name == "x-transcribed-text":
+                            import urllib.parse
+                            try:
+                                decoded = urllib.parse.unquote(value)
+                                print(f"\n    📝 Transcribed text: {decoded[:200]}...")
+                            except:
+                                pass
+                        elif name == "x-llm-model":
+                            print(f"    🤖 LLM Model: {value}")
+            
+            # Send CONNECTION_CLOSE
+            print(f"\n[6] Closing connection...")
+            print("-" * 40)
+            client.send_connection_close()
+            
+        else:
+            print(f"\n[3] Handshake result: FAILED ❌")
+            
+    except KeyboardInterrupt:
+        print(f"\n\n[!] Ctrl+C received, exiting...")
+    except Exception as e:
+        print(f"\n[!] Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Print final statistics
+        print(f"\n    === Final Statistics ===")
+        print(f"    UDP packets received: {client.packets_received}")
+        print(f"    Bytes received: {client.bytes_received}")
+        print(f"    Packets sent: {client.packets_sent}")
+        
+        # Check if peer closed the connection
+        if client._peer_closed:
+            print(f"\n    ⚠️ Connection closed by peer:")
+            print(f"       Error code: {client._peer_close_error_code}")
+            if client._peer_close_reason:
+                print(f"       Reason: {client._peer_close_reason}")
+        
         client.close()
     
     print("\n" + "=" * 60)
@@ -442,6 +619,14 @@ async def realtime_quic_handshake(hostname: str, port: int, debug: bool = True, 
         print(f"    Initial packets: {len(client.initial_tracker.received_pns)}")
         print(f"    Handshake packets: {len(client.handshake_tracker.received_pns)}")
         print(f"    1-RTT packets: {len(client.app_tracker.received_pns)}")
+        
+        # Check if peer closed the connection
+        if client._peer_closed:
+            print(f"\n    ⚠️ Connection closed by peer:")
+            print(f"       Error code: {client._peer_close_error_code}")
+            if client._peer_close_reason:
+                print(f"       Reason: {client._peer_close_reason}")
+        
         client.close()
     
     print("\n" + "=" * 60)
@@ -541,6 +726,18 @@ Examples:
     )
     
     parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Enable chat stream mode (POST OGG file to /pocket-sage/chat/stream)"
+    )
+    
+    parser.add_argument(
+        "--ogg",
+        default="tmp/test.ogg",
+        help="Path to OGG audio file for chat mode (default: tmp/test.ogg)"
+    )
+    
+    parser.add_argument(
         "-q", "--quiet",
         action="store_true",
         help="Disable debug output"
@@ -557,12 +754,18 @@ Examples:
     concurrent_mode = args.concurrent
     zero_rtt_mode = args.zero_rtt
     force_zero_rtt = args.force_zero_rtt
+    chat_mode = args.chat
+    ogg_file = args.ogg
     paths = args.paths
     debug = not args.quiet
     
     print(f"HTTP/3 Client - Keys will be written to {keylog_file} (Wireshark SSLKEYLOGFILE format)")
     
-    if zero_rtt_mode:
+    if chat_mode:
+        print(f"Mode: CHAT STREAM")
+        print(f"Target: https://{hostname}:{port}/pocket-sage/chat/stream")
+        print(f"OGG file: {ogg_file}")
+    elif zero_rtt_mode:
         print(f"Mode: 0-RTT REQUEST")
         if not session_file:
             print("⚠️ Warning: 0-RTT mode requires --session option")
@@ -584,7 +787,10 @@ Examples:
     print(f"Press Ctrl+C to exit\n")
     
     try:
-        if zero_rtt_mode:
+        if chat_mode:
+            asyncio.run(http3_chat_stream(hostname, port, ogg_file, debug=debug,
+                                           keylog_file=keylog_file, session_file=session_file))
+        elif zero_rtt_mode:
             asyncio.run(http3_0rtt_request(hostname, port, path, debug=debug, 
                                            keylog_file=keylog_file, session_file=session_file))
         elif concurrent_mode:

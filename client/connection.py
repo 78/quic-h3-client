@@ -129,6 +129,13 @@ class RealtimeQUICClient:
         # Events
         self.handshake_complete = asyncio.Event()
         self.connection_closed = asyncio.Event()
+        self._cwnd_available = asyncio.Event()  # Signaled when cwnd has space
+        self._cwnd_available.set()  # Initially available
+        
+        # Peer close tracking
+        self._peer_closed = False  # True if peer sent CONNECTION_CLOSE
+        self._peer_close_error_code: Optional[int] = None
+        self._peer_close_reason: str = ""
         
         # Stats
         self.packets_received = 0
@@ -146,9 +153,9 @@ class RealtimeQUICClient:
         self.h3_local_decoder_stream_id = 10
         self.h3_local_decoder_stream_offset = 0  # Track offset for decoder stream
         self.h3_settings = {
-            0x01: 4096,  # QPACK_MAX_TABLE_CAPACITY
-            0x07: 16,    # QPACK_BLOCKED_STREAMS
-            0x08: 1,     # EXTENDED_CONNECT
+            0x01: 0,    # QPACK_MAX_TABLE_CAPACITY (Typically 4096 for high-bandwidth devices)
+            0x07: 0,    # QPACK_BLOCKED_STREAMS (Typically 16 for high-bandwidth devices)
+            0x08: 0,    # EXTENDED_CONNECT (Typically 1 for WebTransport)
         }
         self.h3_max_push_id = 8
         
@@ -169,6 +176,13 @@ class RealtimeQUICClient:
         # Response events for waiting on responses
         self.response_events = {}  # stream_id -> asyncio.Event
         self.pending_responses = {}  # stream_id -> response data
+        
+        # Pending stream data for chunked uploads (legacy)
+        self._pending_stream_data = {}  # stream_id -> {data, offset, total, ...}
+        
+        # Stream write state for streaming API
+        self._stream_write_offset = {}  # stream_id -> current write offset
+        self._stream_write_ready = {}   # stream_id -> asyncio.Event (flow control)
         
         # Pending 0-RTT requests (sent before handshake completes)
         self.pending_0rtt_requests = []  # List of (stream_id, request_info)
@@ -215,6 +229,27 @@ class RealtimeQUICClient:
         self._fc_stream_max_sent: Dict[int, int] = {}  # stream_id -> last MAX_STREAM_DATA sent
         self._fc_stream_received: Dict[int, int] = {}  # stream_id -> bytes received on stream
         
+        # =================================================================
+        # SEND-SIDE flow control (respecting peer's limits)
+        # These limits are set by the server in EncryptedExtensions
+        # and updated via MAX_DATA/MAX_STREAM_DATA frames
+        # =================================================================
+        
+        # Connection-level send flow control
+        self._peer_max_data: int = 65536  # Peer's initial_max_data (will be updated from transport params)
+        self._data_sent: int = 0  # Total bytes we've sent on all streams
+        
+        # Per-stream send flow control
+        self._peer_max_stream_data_bidi_local: int = 65536  # For client-initiated bidi streams
+        self._peer_max_stream_data_bidi_remote: int = 65536  # For server-initiated bidi streams
+        self._peer_max_stream_data_uni: int = 65536  # For unidirectional streams
+        self._stream_data_sent: Dict[int, int] = {}  # stream_id -> bytes sent on this stream
+        self._peer_stream_max_data: Dict[int, int] = {}  # stream_id -> current limit from peer
+        
+        # Blocked state (to avoid sending duplicate BLOCKED frames)
+        self._connection_blocked_at: Optional[int] = None
+        self._stream_blocked_at: Dict[int, int] = {}  # stream_id -> limit we reported blocked at
+        
     async def connect(self):
         """Resolve hostname and create UDP socket."""
         self.target_ip = socket.gethostbyname(self.hostname)
@@ -229,6 +264,12 @@ class RealtimeQUICClient:
         
     def send(self, data: bytes):
         """Send UDP packet."""
+        # Don't send if peer has closed the connection
+        if self._peer_closed:
+            if self.debug:
+                print(f"    ⚠️ Cannot send: peer has closed connection")
+            return
+        
         if self.transport:
             self.transport.sendto(data)
             self.packets_sent += 1
@@ -257,11 +298,21 @@ class RealtimeQUICClient:
         """
         try:
             while True:
+                # Stop the timer loop if peer has closed the connection
+                if self._peer_closed:
+                    if self.debug:
+                        print(f"    🛑 PTO timer stopped: peer has closed connection")
+                    break
+                
                 pto_time = self.loss_detector.get_pto_time(self._handshake_confirmed)
                 now = time.time()
                 delay = max(0.01, pto_time - now)  # At least 10ms
                 
                 await asyncio.sleep(delay)
+                
+                # Check again after sleep
+                if self._peer_closed:
+                    break
                 
                 # Check if we need to retransmit
                 now = time.time()
@@ -289,6 +340,10 @@ class RealtimeQUICClient:
     
     def _handle_pto_timeout(self, space: PacketNumberSpace):
         """Handle PTO timeout by sending probe packets."""
+        # Don't retransmit if peer has closed the connection
+        if self._peer_closed:
+            return
+        
         self.loss_detector.pto_count += 1
         
         if self.debug:
@@ -768,6 +823,10 @@ class RealtimeQUICClient:
         
         if self.debug and newly_acked:
             print(f"      ✓ Acknowledged {len(newly_acked)} packet(s) in {space.value} space")
+        
+        # Signal cwnd available if there's space now
+        if newly_acked and self.loss_detector.cc.available_cwnd() > 0:
+            self._cwnd_available.set()
         
         # Check if Client Finished was ACKed (Handshake confirmation for client)
         # RFC 9001 Section 4.9.2: Client confirms handshake when Finished is ACKed
@@ -1450,8 +1509,21 @@ class RealtimeQUICClient:
                     hint = " (server doesn't support h3 ALPN)"
                 if self.debug:
                     print(f"      ❌ CONNECTION_CLOSE: {error_name} (code={error_code}){hint}")
+                    if reason:
+                        print(f"         Reason: '{reason}'")
+                
+                # Mark connection as closed by peer
+                self._peer_closed = True
+                self._peer_close_error_code = error_code if isinstance(error_code, int) else 0
+                self._peer_close_reason = reason
                 self.state = HandshakeState.FAILED
                 self.connection_closed.set()
+                
+                # Cancel PTO timer to stop retransmissions
+                if self._pto_timer_task and not self._pto_timer_task.done():
+                    self._pto_timer_task.cancel()
+                    if self.debug:
+                        print(f"      🛑 PTO timer cancelled")
             else:
                 ack_eliciting = True
         return ack_eliciting
@@ -1548,19 +1620,25 @@ class RealtimeQUICClient:
                 if self.debug and msg["type"] not in ["PADDING"]:
                     print(f"      📨 {msg['type']} ({msg['length']} bytes)")
                 
-                # Check for early_data acceptance in EncryptedExtensions
-                if msg["type"] == "EncryptedExtensions" and self.zero_rtt_enabled:
+                # Process EncryptedExtensions
+                if msg["type"] == "EncryptedExtensions":
                     extensions = msg.get("extensions", [])
-                    for ext in extensions:
-                        if ext.get("name") == "early_data":
-                            self.zero_rtt_accepted = True
+                    
+                    # Check for early_data acceptance
+                    if self.zero_rtt_enabled:
+                        for ext in extensions:
+                            if ext.get("name") == "early_data":
+                                self.zero_rtt_accepted = True
+                                if self.debug:
+                                    print(f"         🎉 Server accepted 0-RTT early data!")
+                                break
+                        if not self.zero_rtt_accepted:
+                            self.zero_rtt_rejected = True
                             if self.debug:
-                                print(f"         🎉 Server accepted 0-RTT early data!")
-                            break
-                    if not self.zero_rtt_accepted:
-                        self.zero_rtt_rejected = True
-                        if self.debug:
-                            print(f"         ⚠️ Server did not accept 0-RTT (no early_data extension)")
+                                print(f"         ⚠️ Server did not accept 0-RTT (no early_data extension)")
+                    
+                    # Extract server's transport parameters for flow control
+                    self._process_server_transport_params(extensions)
                 
                 if msg["type"] == "Finished" and not self.finished_received:
                     self.finished_received = True
@@ -1767,8 +1845,47 @@ class RealtimeQUICClient:
                 offset += consumed
                 reason = payload[offset:offset + reason_length].decode('utf-8', errors='replace')
                 offset += reason_length
+                
+                # Map common error codes for display
+                error_names = {
+                    0x00: "NO_ERROR",
+                    0x01: "INTERNAL_ERROR", 
+                    0x02: "CONNECTION_REFUSED",
+                    0x03: "FLOW_CONTROL_ERROR",
+                    0x04: "STREAM_LIMIT_ERROR",
+                    0x05: "STREAM_STATE_ERROR",
+                    0x06: "FINAL_SIZE_ERROR",
+                    0x07: "FRAME_ENCODING_ERROR",
+                    0x08: "TRANSPORT_PARAMETER_ERROR",
+                    0x09: "CONNECTION_ID_LIMIT_ERROR",
+                    0x0a: "PROTOCOL_VIOLATION",
+                    0x0b: "INVALID_TOKEN",
+                    0x0c: "APPLICATION_ERROR",
+                    0x0d: "CRYPTO_BUFFER_EXCEEDED",
+                    0x0e: "KEY_UPDATE_ERROR",
+                    0x0f: "AEAD_LIMIT_REACHED",
+                    0x10: "NO_VIABLE_PATH",
+                }
+                close_type = "Application" if frame_type == 0x1d else "Transport"
+                error_name = error_names.get(error_code, f"0x{error_code:04x}")
+                
                 if self.debug:
-                    print(f"        CONNECTION_CLOSE: error={error_code}, reason='{reason}'")
+                    print(f"        ❌ CONNECTION_CLOSE ({close_type}): {error_name} (code={error_code})")
+                    if reason:
+                        print(f"           Reason: '{reason}'")
+                
+                # Mark connection as closed by peer
+                self._peer_closed = True
+                self._peer_close_error_code = error_code
+                self._peer_close_reason = reason
+                self.state = HandshakeState.FAILED
+                self.connection_closed.set()
+                
+                # Cancel PTO timer to stop retransmissions
+                if self._pto_timer_task and not self._pto_timer_task.done():
+                    self._pto_timer_task.cancel()
+                    if self.debug:
+                        print(f"        🛑 PTO timer cancelled")
             elif frame_type == 0x18 or frame_type == 0x19:  # NEW_CONNECTION_ID
                 ack_eliciting = True
                 seq_num, consumed = decode_varint(payload, offset)
@@ -1801,22 +1918,78 @@ class RealtimeQUICClient:
                 offset += consumed
                 final_size, consumed = decode_varint(payload, offset)
                 offset += consumed
+                
+                # Mark stream as reset by peer - stop sending data
+                if not hasattr(self, '_reset_streams'):
+                    self._reset_streams = {}
+                self._reset_streams[stream_id] = app_error
+                
+                # Wake up any blocked writers so they can detect the reset
+                self._cwnd_available.set()
+                
                 if self.debug:
-                    print(f"        RESET_STREAM: stream={stream_id}, error={app_error}")
+                    error_name = {256: "H3_NO_ERROR", 257: "H3_GENERAL_PROTOCOL_ERROR", 
+                                 258: "H3_REQUEST_CANCELLED", 259: "H3_INTERNAL_ERROR"}.get(app_error, f"0x{app_error:x}")
+                    print(f"        ⚠️ RESET_STREAM: stream={stream_id}, error={error_name} ({app_error})")
+            elif frame_type == 0x05:  # STOP_SENDING
+                ack_eliciting = True
+                stream_id, consumed = decode_varint(payload, offset)
+                offset += consumed
+                app_error, consumed = decode_varint(payload, offset)
+                offset += consumed
+                
+                # Mark stream as stopped by peer - stop sending data
+                if not hasattr(self, '_reset_streams'):
+                    self._reset_streams = {}
+                self._reset_streams[stream_id] = app_error
+                
+                # Wake up any blocked writers so they can detect the stop
+                self._cwnd_available.set()
+                
+                if self.debug:
+                    error_name = {256: "H3_NO_ERROR", 257: "H3_GENERAL_PROTOCOL_ERROR", 
+                                 258: "H3_REQUEST_CANCELLED", 259: "H3_INTERNAL_ERROR"}.get(app_error, f"0x{app_error:x}")
+                    print(f"        ⚠️ STOP_SENDING: stream={stream_id}, error={error_name} ({app_error})")
             elif frame_type == 0x10:  # MAX_DATA
                 ack_eliciting = True
                 max_data, consumed = decode_varint(payload, offset)
                 offset += consumed
-                if self.debug:
-                    print(f"        MAX_DATA: {max_data}")
+                # Update send-side flow control limit
+                if max_data > self._peer_max_data:
+                    old_limit = self._peer_max_data
+                    self._peer_max_data = max_data
+                    # Clear connection blocked state since we have more capacity
+                    self._connection_blocked_at = None
+                    # Wake up any blocked writers waiting for flow control
+                    self._cwnd_available.set()
+                    if self.debug:
+                        print(f"        MAX_DATA: {max_data} (was {old_limit}, +{max_data - old_limit})")
+                else:
+                    if self.debug:
+                        print(f"        MAX_DATA: {max_data} (no increase)")
             elif frame_type == 0x11:  # MAX_STREAM_DATA
                 ack_eliciting = True
                 stream_id, consumed = decode_varint(payload, offset)
                 offset += consumed
                 max_stream_data, consumed = decode_varint(payload, offset)
                 offset += consumed
-                if self.debug:
-                    print(f"        MAX_STREAM_DATA: stream={stream_id}, max={max_stream_data}")
+                # Update per-stream send flow control limit
+                # Use initial limit from transport params if not yet tracked
+                current_limit = self._peer_stream_max_data.get(
+                    stream_id, self._get_initial_stream_limit(stream_id)
+                )
+                if max_stream_data > current_limit:
+                    self._peer_stream_max_data[stream_id] = max_stream_data
+                    # Clear stream blocked state
+                    if stream_id in self._stream_blocked_at:
+                        del self._stream_blocked_at[stream_id]
+                    # Wake up any blocked writers waiting for flow control
+                    self._cwnd_available.set()
+                    if self.debug:
+                        print(f"        MAX_STREAM_DATA: stream={stream_id}, max={max_stream_data} (was {current_limit})")
+                else:
+                    if self.debug:
+                        print(f"        MAX_STREAM_DATA: stream={stream_id}, max={max_stream_data} (no increase)")
             elif frame_type == 0x12:  # MAX_STREAMS (BIDI)
                 ack_eliciting = True
                 max_streams, consumed = decode_varint(payload, offset)
@@ -1970,6 +2143,71 @@ class RealtimeQUICClient:
         if self.debug:
             print(f"    → Sent QPACK decoder instructions ({len(instructions)} bytes)")
     
+    def _process_server_transport_params(self, extensions: list):
+        """
+        Process server's transport parameters from EncryptedExtensions.
+        
+        Updates send-side flow control limits based on server's advertised values.
+        
+        Args:
+            extensions: List of TLS extensions from EncryptedExtensions message
+        """
+        for ext in extensions:
+            if ext.get("name") == "quic_transport_params":
+                params = ext.get("params", {})
+                
+                if self.debug:
+                    print(f"         📋 Server transport parameters:")
+                
+                # Connection-level flow control limit
+                if "initial_max_data" in params:
+                    value = params["initial_max_data"]
+                    if isinstance(value, int):
+                        self._peer_max_data = value
+                        if self.debug:
+                            print(f"            initial_max_data: {value}")
+                
+                # Stream-level flow control limits
+                # For client-initiated bidirectional streams (what we use for requests)
+                if "initial_max_stream_data_bidi_local" in params:
+                    value = params["initial_max_stream_data_bidi_local"]
+                    if isinstance(value, int):
+                        self._peer_max_stream_data_bidi_local = value
+                        if self.debug:
+                            print(f"            initial_max_stream_data_bidi_local: {value}")
+                
+                # For server-initiated bidirectional streams
+                if "initial_max_stream_data_bidi_remote" in params:
+                    value = params["initial_max_stream_data_bidi_remote"]
+                    if isinstance(value, int):
+                        self._peer_max_stream_data_bidi_remote = value
+                        if self.debug:
+                            print(f"            initial_max_stream_data_bidi_remote: {value}")
+                
+                # For unidirectional streams (HTTP/3 control streams)
+                if "initial_max_stream_data_uni" in params:
+                    value = params["initial_max_stream_data_uni"]
+                    if isinstance(value, int):
+                        self._peer_max_stream_data_uni = value
+                        if self.debug:
+                            print(f"            initial_max_stream_data_uni: {value}")
+                
+                # Update max_ack_delay in loss detector
+                if "max_ack_delay" in params:
+                    value_str = params["max_ack_delay"]
+                    # Parse value like "25 ms"
+                    if isinstance(value_str, str) and "ms" in value_str:
+                        ms_value = int(value_str.replace("ms", "").strip())
+                        self.loss_detector.max_ack_delay = ms_value / 1000.0
+                    elif isinstance(value_str, int):
+                        self.loss_detector.max_ack_delay = value_str / 1000.0
+                
+                if self.debug:
+                    print(f"            📊 Send flow control: connection={self._peer_max_data}, "
+                          f"stream_bidi_remote={self._peer_max_stream_data_bidi_remote}")
+                
+                break  # Found transport params, no need to continue
+    
     def _update_flow_control(self, stream_id: int, data_len: int):
         """
         Update flow control counters and send window updates if needed.
@@ -2073,6 +2311,151 @@ class RealtimeQUICClient:
                 if self.debug:
                     print(f"    → Sent MAX_STREAM_DATA: stream={stream_id}, limit={new_limit} (received={consumed})")
     
+    # =========================================================================
+    # Send-side flow control and congestion control checks
+    # =========================================================================
+    
+    def _get_initial_stream_limit(self, stream_id: int) -> int:
+        """
+        Get the initial flow control limit for a stream based on its type.
+        
+        RFC 9000 Transport Parameters:
+        - initial_max_stream_data_bidi_local: Limit for locally-initiated bidi streams
+          (server's perspective: server-initiated; client receives this for server's streams)
+        - initial_max_stream_data_bidi_remote: Limit for peer-initiated bidi streams
+          (server's perspective: client-initiated; client uses this for our request streams)
+        
+        Args:
+            stream_id: Stream ID
+            
+        Returns:
+            int: Initial flow control limit from peer's transport parameters
+        """
+        # Stream ID encoding (RFC 9000 Section 2.1):
+        # - Bit 0: Initiator (0 = client, 1 = server)
+        # - Bit 1: Direction (0 = bidirectional, 1 = unidirectional)
+        is_server_initiated = (stream_id & 0x01) == 1
+        is_unidirectional = (stream_id & 0x02) == 2
+        
+        if is_unidirectional:
+            return self._peer_max_stream_data_uni
+        elif is_server_initiated:
+            # Server-initiated bidi stream - use bidi_local (server's local = our limit for receiving)
+            # This is the limit on data WE can send on server-initiated streams
+            return self._peer_max_stream_data_bidi_local
+        else:
+            # Client-initiated bidirectional (our request streams)
+            # Server's bidi_remote = limit for peer (client) initiated streams
+            # This is the limit on data WE can send on our streams
+            return self._peer_max_stream_data_bidi_remote
+    
+    def _get_stream_send_limit(self, stream_id: int) -> int:
+        """
+        Get the current send limit for a stream.
+        
+        Args:
+            stream_id: Stream ID
+            
+        Returns:
+            int: Current flow control limit for this stream
+        """
+        if stream_id in self._peer_stream_max_data:
+            return self._peer_stream_max_data[stream_id]
+        # Use initial limit from transport parameters
+        return self._get_initial_stream_limit(stream_id)
+    
+    def _can_send_stream_data(self, stream_id: int, data_len: int) -> tuple:
+        """
+        Check if we can send data on a stream, considering:
+        1. Congestion window
+        2. Connection-level flow control
+        3. Stream-level flow control
+        
+        Args:
+            stream_id: Stream ID to send on
+            data_len: Number of bytes to send
+            
+        Returns:
+            tuple: (can_send: bool, max_bytes: int, reason: str)
+                - can_send: True if any data can be sent
+                - max_bytes: Maximum bytes that can be sent (may be less than data_len)
+                - reason: Empty string if can send, otherwise reason for blocking
+        """
+        # 1. Check congestion window
+        available_cwnd = self.loss_detector.cc.available_cwnd()
+        if available_cwnd <= 0:
+            return (False, 0, "congestion_window_full")
+        
+        # 2. Check connection-level flow control
+        connection_available = self._peer_max_data - self._data_sent
+        if connection_available <= 0:
+            # Send DATA_BLOCKED frame if we haven't already
+            if self._connection_blocked_at != self._peer_max_data:
+                self._send_data_blocked_frame(self._peer_max_data)
+                self._connection_blocked_at = self._peer_max_data
+            return (False, 0, "connection_flow_control")
+        
+        # 3. Check stream-level flow control
+        stream_sent = self._stream_data_sent.get(stream_id, 0)
+        stream_limit = self._get_stream_send_limit(stream_id)
+        stream_available = stream_limit - stream_sent
+        if stream_available <= 0:
+            # Send STREAM_DATA_BLOCKED frame if we haven't already
+            blocked_at = self._stream_blocked_at.get(stream_id, -1)
+            if blocked_at != stream_limit:
+                self._send_stream_data_blocked_frame(stream_id, stream_limit)
+                self._stream_blocked_at[stream_id] = stream_limit
+            return (False, 0, "stream_flow_control")
+        
+        # Calculate maximum bytes we can send
+        max_bytes = min(data_len, available_cwnd, connection_available, stream_available)
+        
+        return (True, max_bytes, "")
+    
+    def _on_stream_data_sent(self, stream_id: int, data_len: int):
+        """
+        Update counters after sending stream data.
+        
+        Args:
+            stream_id: Stream ID
+            data_len: Number of bytes sent
+        """
+        self._data_sent += data_len
+        self._stream_data_sent[stream_id] = self._stream_data_sent.get(stream_id, 0) + data_len
+    
+    def _send_data_blocked_frame(self, limit: int):
+        """Send DATA_BLOCKED frame to peer."""
+        if not self.application_secrets:
+            return
+        
+        # Build DATA_BLOCKED frame (type 0x14)
+        frame = encode_varint(0x14) + encode_varint(limit)
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, frame)
+        self.send(packet)
+        self.client_app_pn += 1
+        
+        if self.debug:
+            print(f"    → Sent DATA_BLOCKED: limit={limit}, sent={self._data_sent}")
+    
+    def _send_stream_data_blocked_frame(self, stream_id: int, limit: int):
+        """Send STREAM_DATA_BLOCKED frame to peer."""
+        if not self.application_secrets:
+            return
+        
+        # Build STREAM_DATA_BLOCKED frame (type 0x15)
+        frame = encode_varint(0x15) + encode_varint(stream_id) + encode_varint(limit)
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, frame)
+        self.send(packet)
+        self.client_app_pn += 1
+        
+        if self.debug:
+            sent = self._stream_data_sent.get(stream_id, 0)
+            print(f"    → Sent STREAM_DATA_BLOCKED: stream={stream_id}, limit={limit}, sent={sent}")
+    
     def _send_1rtt_ack(self):
         """Send ACK for 1-RTT packets using Short Header."""
         if self.app_tracker.largest_pn < 0:
@@ -2168,7 +2551,7 @@ class RealtimeQUICClient:
     def send_request(self, method: str = "GET", path: str = "/", 
                      headers: dict = None, body: bytes = None) -> int:
         """
-        Send an HTTP/3 request.
+        Send an HTTP/3 request. Supports large bodies by splitting into multiple packets.
         
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -2203,71 +2586,209 @@ class RealtimeQUICClient:
         # Build HTTP/3 HEADERS frame
         headers_frame = build_h3_headers_frame(qpack_headers)
         
-        # Build stream data
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        
+        # Maximum payload size per packet (conservative estimate for UDP)
+        # QUIC header + STREAM frame overhead is ~40-60 bytes, auth tag is 16 bytes
+        # Use 1100 bytes as safe payload limit per packet
+        MAX_STREAM_DATA_PER_PACKET = 1100
+        
+        # Build complete stream data
         stream_data = headers_frame
         if body:
             data_frame = build_h3_data_frame(body)
             stream_data += data_frame
         
-        # Determine if this is the final frame
-        has_body = body is not None and len(body) > 0
-        fin = True  # For simple requests, we send everything in one shot
+        # Check flow control and congestion control before sending
+        can_send, max_bytes, block_reason = self._can_send_stream_data(stream_id, len(stream_data))
         
-        # Build STREAM frame
-        stream_frame = build_stream_frame(
-            stream_id=stream_id,
-            data=stream_data,
-            offset=0,
-            fin=fin
-        )
+        if self.debug:
+            cc_stats = self.loss_detector.cc.get_stats()
+            print(f"    📊 Send check: cwnd={cc_stats['cwnd']}, in_flight={cc_stats['bytes_in_flight']}, "
+                  f"available={cc_stats['available_cwnd']}")
+            print(f"       Flow control: peer_max_data={self._peer_max_data}, sent={self._data_sent}, "
+                  f"stream_limit={self._get_stream_send_limit(stream_id)}")
         
-        dcid = self.server_scid if self.server_scid else self.original_dcid
-        
-        # Build and send the 1-RTT packet
-        packet = self._build_short_header_packet(dcid, self.client_app_pn, stream_frame)
-        pn = self.client_app_pn
-        self.client_app_pn += 1
-        
-        # Track the sent packet for loss detection
-        self._track_sent_packet(
-            PacketNumberSpace.APPLICATION,
-            pn,
-            len(packet),
-            frames=[{
-                "type": "STREAM",
-                "stream_id": stream_id,
-                "offset": 0,
+        # Check if we can send all data in one packet and flow control allows it
+        if len(stream_data) <= MAX_STREAM_DATA_PER_PACKET and can_send and max_bytes >= len(stream_data):
+            # Small request - send in one packet
+            stream_frame = build_stream_frame(
+                stream_id=stream_id,
+                data=stream_data,
+                offset=0,
+                fin=True
+            )
+            
+            packet = self._build_short_header_packet(dcid, self.client_app_pn, stream_frame)
+            pn = self.client_app_pn
+            self.client_app_pn += 1
+            
+            self._track_sent_packet(
+                PacketNumberSpace.APPLICATION,
+                pn,
+                len(packet),
+                frames=[{
+                    "type": "STREAM",
+                    "stream_id": stream_id,
+                    "offset": 0,
+                    "data": stream_data,
+                    "fin": True
+                }]
+            )
+            
+            self.send(packet)
+            
+            # Update send-side flow control counters
+            self._on_stream_data_sent(stream_id, len(stream_data))
+            
+            if self.debug:
+                print(f"    → Sent HTTP/3 {method} request to {path}")
+                print(f"      Stream ID: {stream_id}, PN: {pn}")
+                print(f"      HEADERS frame: {len(headers_frame)} bytes")
+                if body:
+                    print(f"      DATA frame: {len(body)} bytes")
+                print(f"      Total packet: {len(packet)} bytes")
+        else:
+            # Large request OR flow control blocked - store data for chunked sending
+            self._pending_stream_data[stream_id] = {
                 "data": stream_data,
-                "fin": fin
-            }]
-        )
-        
-        self.send(packet)
+                "offset": 0,
+                "total": len(stream_data),
+                "headers_len": len(headers_frame),
+                "body_len": len(body) if body else 0,
+                "method": method,
+                "path": path,
+                "chunk_size": MAX_STREAM_DATA_PER_PACKET,
+            }
+            
+            if self.debug:
+                reason = f" (blocked: {block_reason})" if block_reason else ""
+                print(f"    → Preparing HTTP/3 {method} request to {path} (chunked{reason})")
+                print(f"      Stream ID: {stream_id}")
+                print(f"      Total data: {len(stream_data)} bytes")
+            
+            # Try to send initial chunks if we can
+            if can_send and max_bytes > 0:
+                self._send_stream_chunks(stream_id, max_bytes)
         
         # Create event for waiting on response
         self.response_events[stream_id] = asyncio.Event()
         
-        if self.debug:
-            print(f"    → Sent HTTP/3 {method} request to {path}")
-            print(f"      Stream ID: {stream_id}, PN: {pn}")
-            print(f"      HEADERS frame: {len(headers_frame)} bytes")
-            if body:
-                print(f"      DATA frame: {len(body)} bytes")
-            print(f"      Total packet: {len(packet)} bytes")
-        
         return stream_id
+    
+    def _send_stream_chunks(self, stream_id: int, max_bytes: int = None) -> int:
+        """
+        Send pending stream data in chunks, respecting flow control and congestion control.
+        
+        Args:
+            stream_id: The stream to send data for
+            max_bytes: Maximum bytes to send in this call (None = send as much as allowed)
+            
+        Returns:
+            int: Number of bytes sent
+        """
+        if stream_id not in self._pending_stream_data:
+            return 0
+        
+        pending = self._pending_stream_data[stream_id]
+        data = pending["data"]
+        offset = pending["offset"]
+        total = pending["total"]
+        chunk_size = pending["chunk_size"]
+        
+        if offset >= total:
+            return 0
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        bytes_sent = 0
+        packets_sent = 0
+        
+        # Calculate remaining data to send
+        remaining = total - offset
+        
+        while offset < total:
+            # Check flow control and congestion control for each chunk
+            can_send, allowed_bytes, block_reason = self._can_send_stream_data(
+                stream_id, min(chunk_size, total - offset)
+            )
+            
+            if not can_send or allowed_bytes <= 0:
+                if self.debug and block_reason:
+                    print(f"      ⏸️ Send paused: {block_reason} (sent {bytes_sent} bytes)")
+                break
+            
+            # Limit by max_bytes parameter if specified
+            if max_bytes is not None:
+                allowed_bytes = min(allowed_bytes, max_bytes - bytes_sent)
+                if allowed_bytes <= 0:
+                    break
+            
+            # Calculate chunk size respecting all limits
+            current_chunk_size = min(chunk_size, allowed_bytes, total - offset)
+            chunk = data[offset:offset + current_chunk_size]
+            is_last = (offset + current_chunk_size >= total)
+            
+            stream_frame = build_stream_frame(
+                stream_id=stream_id,
+                data=chunk,
+                offset=offset,
+                fin=is_last
+            )
+            
+            packet = self._build_short_header_packet(dcid, self.client_app_pn, stream_frame)
+            pn = self.client_app_pn
+            self.client_app_pn += 1
+            
+            self._track_sent_packet(
+                PacketNumberSpace.APPLICATION,
+                pn,
+                len(packet),
+                frames=[{
+                    "type": "STREAM",
+                    "stream_id": stream_id,
+                    "offset": offset,
+                    "data": chunk,
+                    "fin": is_last
+                }]
+            )
+            
+            self.send(packet)
+            
+            # Update send-side flow control counters
+            self._on_stream_data_sent(stream_id, current_chunk_size)
+            
+            offset += current_chunk_size
+            bytes_sent += current_chunk_size
+            packets_sent += 1
+        
+        # Update pending offset
+        pending["offset"] = offset
+        
+        if self.debug and packets_sent > 0:
+            progress = offset * 100 // total
+            print(f"      📤 Sent {packets_sent} packets, {bytes_sent} bytes ({progress}% complete)")
+        
+        # Clean up if done
+        if offset >= total:
+            del self._pending_stream_data[stream_id]
+            if self.debug:
+                print(f"      ✅ Stream {stream_id} upload complete")
+        
+        return bytes_sent
     
     async def request(self, method: str = "GET", path: str = "/",
                       headers: dict = None, body: bytes = None,
                       timeout: float = 10.0) -> dict:
         """
         Send an HTTP/3 request and wait for the response.
+        For requests with body, sends everything at once (suitable for small bodies).
+        For large bodies, use open_stream() + write() + finish() instead.
         
         Args:
             method: HTTP method (GET, POST, etc.)
             path: Request path  
             headers: Additional headers dict
-            body: Request body (for POST, PUT, etc.)
+            body: Request body (for POST, PUT, etc.) - should be small (<50KB)
             timeout: Response timeout in seconds
             
         Returns:
@@ -2276,13 +2797,45 @@ class RealtimeQUICClient:
         stream_id = self.send_request(method, path, headers, body)
         
         try:
-            await asyncio.wait_for(
-                self.response_events[stream_id].wait(),
-                timeout=timeout
+            # Wait for either response or connection close
+            response_task = asyncio.create_task(self.response_events[stream_id].wait())
+            close_task = asyncio.create_task(self.connection_closed.wait())
+            
+            done, pending = await asyncio.wait(
+                [response_task, close_task],
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED
             )
             
-            response = self.pending_responses.get(stream_id, {})
-            return response
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+            
+            # Check if connection was closed by peer
+            if close_task in done and self._peer_closed:
+                if self.debug:
+                    print(f"    ❌ Request failed: connection closed by peer (error={self._peer_close_error_code})")
+                return {
+                    "status": None,
+                    "headers": [],
+                    "body": b"",
+                    "error": f"connection_closed (code={self._peer_close_error_code})"
+                }
+            
+            # Check if response received
+            if response_task in done:
+                response = self.pending_responses.get(stream_id, {})
+                return response
+            
+            # Timeout
+            if self.debug:
+                print(f"    ⏱️ Request timeout for stream {stream_id}")
+            return {
+                "status": None,
+                "headers": [],
+                "body": b"",
+                "error": "timeout"
+            }
             
         except asyncio.TimeoutError:
             if self.debug:
@@ -2294,8 +2847,377 @@ class RealtimeQUICClient:
                 "error": "timeout"
             }
     
+    def open_stream(self, method: str = "POST", path: str = "/",
+                    headers: dict = None) -> int:
+        """
+        Open a new HTTP/3 request stream and send headers (without FIN).
+        Use write() to send body data, then finish() to complete the request.
+        
+        HTTP/3 Streaming Upload:
+            Unlike HTTP/1.1, HTTP/3 does NOT need Transfer-Encoding: chunked.
+            The stream end is signaled by the FIN flag (sent via finish()).
+            Content-Length is optional - if omitted, server relies on FIN.
+        
+        Usage:
+            stream_id = client.open_stream("POST", "/upload", {"content-type": "application/octet-stream"})
+            await client.write(stream_id, chunk1)
+            await client.write(stream_id, chunk2)
+            await client.finish(stream_id)  # Sends FIN flag
+            response = await client.read_response(stream_id)
+        
+        Args:
+            method: HTTP method
+            path: Request path
+            headers: Additional headers dict (content-length is optional)
+            
+        Returns:
+            int: Stream ID for this request
+        """
+        if not self.application_secrets:
+            raise RuntimeError("Cannot open stream: handshake not complete")
+        
+        # Allocate stream ID
+        stream_id = self.next_request_stream_id
+        self.next_request_stream_id += 4
+        
+        # Build request headers
+        extra_headers = headers or {}
+        if "user-agent" not in extra_headers:
+            extra_headers["user-agent"] = "http3-client/1.0"
+        
+        # Build QPACK encoded headers
+        qpack_headers = build_qpack_request_headers(
+            method=method,
+            scheme="https",
+            authority=self.hostname,
+            path=path,
+            extra_headers=extra_headers
+        )
+        
+        # Build HTTP/3 HEADERS frame
+        headers_frame = build_h3_headers_frame(qpack_headers)
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        
+        # Send HEADERS frame (without FIN - more data coming)
+        stream_frame = build_stream_frame(
+            stream_id=stream_id,
+            data=headers_frame,
+            offset=0,
+            fin=False  # More data coming
+        )
+        
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, stream_frame)
+        pn = self.client_app_pn
+        self.client_app_pn += 1
+        
+        self._track_sent_packet(
+            PacketNumberSpace.APPLICATION,
+            pn,
+            len(packet),
+            frames=[{
+                "type": "STREAM",
+                "stream_id": stream_id,
+                "offset": 0,
+                "data": headers_frame,
+                "fin": False
+            }]
+        )
+        
+        self.send(packet)
+        
+        # Update flow control counters for the HEADERS frame
+        self._on_stream_data_sent(stream_id, len(headers_frame))
+        
+        # Initialize stream state for writing
+        self._stream_write_offset[stream_id] = len(headers_frame)
+        self._stream_write_ready[stream_id] = asyncio.Event()
+        self._stream_write_ready[stream_id].set()  # Initially ready to write
+        
+        # Create response event
+        self.response_events[stream_id] = asyncio.Event()
+        
+        if self.debug:
+            print(f"    → Opened HTTP/3 {method} stream to {path}")
+            print(f"      Stream ID: {stream_id}")
+            print(f"      HEADERS frame: {len(headers_frame)} bytes")
+        
+        return stream_id
+    
+    async def write(self, stream_id: int, data: bytes, timeout: float = 30.0) -> int:
+        """
+        Write data to an open stream. Blocks if flow control limit is reached.
+        
+        Args:
+            stream_id: Stream ID from open_stream()
+            data: Data to write (will be wrapped in H3 DATA frame)
+            timeout: Maximum time to wait for flow control
+            
+        Returns:
+            int: Number of bytes written
+        """
+        if stream_id not in self._stream_write_offset:
+            raise RuntimeError(f"Stream {stream_id} not open for writing")
+        
+        # Build HTTP/3 DATA frame
+        data_frame = build_h3_data_frame(data)
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        offset = self._stream_write_offset[stream_id]
+        
+        # Flow control parameters
+        MAX_CHUNK_SIZE = 1100  # Max payload per packet
+        
+        total_size = len(data_frame)
+        sent = 0
+        packets_sent = 0
+        start_time = asyncio.get_event_loop().time()
+        
+        while sent < total_size:
+            # Check if stream was reset by peer
+            if hasattr(self, '_reset_streams') and stream_id in self._reset_streams:
+                error_code = self._reset_streams[stream_id]
+                if self.debug:
+                    print(f"    ❌ Stream {stream_id} was reset by peer (error={error_code}), stopping write")
+                raise RuntimeError(f"Stream {stream_id} reset by peer with error {error_code}")
+            
+            # Wait for permission to write (flow control)
+            try:
+                await asyncio.wait_for(
+                    self._stream_write_ready[stream_id].wait(),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                if self.debug:
+                    print(f"    ⏱️ Write timeout on stream {stream_id}")
+                break
+            
+            # Check if stream was reset while waiting
+            if hasattr(self, '_reset_streams') and stream_id in self._reset_streams:
+                error_code = self._reset_streams[stream_id]
+                if self.debug:
+                    print(f"    ❌ Stream {stream_id} was reset by peer (error={error_code}), stopping write")
+                raise RuntimeError(f"Stream {stream_id} reset by peer with error {error_code}")
+            
+            # Check congestion control and flow control
+            remaining = total_size - sent
+            can_send, allowed_bytes, block_reason = self._can_send_stream_data(stream_id, remaining)
+            
+            if not can_send or allowed_bytes <= 0:
+                if self.debug and block_reason:
+                    print(f"      ⏸️ Write paused: {block_reason}")
+                
+                # Track flow control stalls
+                if not hasattr(self, '_fc_stall_count'):
+                    self._fc_stall_count = 0
+                    self._fc_stall_start = asyncio.get_event_loop().time()
+                
+                self._fc_stall_count += 1
+                
+                # Send PING every 5 stalls to keep connection alive
+                if self._fc_stall_count % 5 == 0:
+                    self._send_ping_probe()
+                    if self.debug:
+                        stream_limit = self._get_stream_send_limit(stream_id)
+                        stream_sent = self._stream_data_sent.get(stream_id, 0)
+                        print(f"      📊 Flow control status: sent={stream_sent}, limit={stream_limit}, "
+                              f"need={total_size + self._stream_write_offset.get(stream_id, 0) - stream_sent}")
+                
+                # Check for flow control deadlock (no progress for too long)
+                if self._fc_stall_count >= 30:  # ~30 seconds of stalls
+                    stall_duration = asyncio.get_event_loop().time() - self._fc_stall_start
+                    if self.debug:
+                        print(f"      ⚠️ Flow control stall: {self._fc_stall_count} iterations, "
+                              f"{stall_duration:.1f}s, no progress. Server may have small window.")
+                    self._fc_stall_count = 0  # Reset and try again
+                
+                # Clear the event and wait for ACK to signal cwnd available
+                self._cwnd_available.clear()
+                try:
+                    await asyncio.wait_for(self._cwnd_available.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if self.debug:
+                        print(f"      ⏱️ Timeout waiting for cwnd")
+                continue
+            else:
+                # Reset stall counter when we can send
+                if hasattr(self, '_fc_stall_count'):
+                    self._fc_stall_count = 0
+            
+            # Send as much as allowed by cwnd and flow control
+            batch_end = min(sent + allowed_bytes, total_size)
+            packets_in_batch = 0
+            
+            while sent < batch_end:
+                chunk_size = min(MAX_CHUNK_SIZE, batch_end - sent)
+                chunk = data_frame[sent:sent + chunk_size]
+                
+                stream_frame = build_stream_frame(
+                    stream_id=stream_id,
+                    data=chunk,
+                    offset=offset,
+                    fin=False  # Not finished yet
+                )
+                
+                packet = self._build_short_header_packet(dcid, self.client_app_pn, stream_frame)
+                pn = self.client_app_pn
+                self.client_app_pn += 1
+                
+                self._track_sent_packet(
+                    PacketNumberSpace.APPLICATION,
+                    pn,
+                    len(packet),
+                    frames=[{
+                        "type": "STREAM",
+                        "stream_id": stream_id,
+                        "offset": offset,
+                        "data": chunk,
+                        "fin": False
+                    }]
+                )
+                
+                self.send(packet)
+                
+                # Update flow control counters
+                self._on_stream_data_sent(stream_id, chunk_size)
+                
+                sent += chunk_size
+                offset += chunk_size
+                packets_in_batch += 1
+                packets_sent += 1
+            
+            # Update offset
+            self._stream_write_offset[stream_id] = offset
+            
+            if self.debug and packets_in_batch > 0:
+                progress = sent * 100 // total_size
+                cc_stats = self.loss_detector.cc.get_stats()
+                print(f"      📤 Wrote {packets_in_batch} packets ({progress}%), "
+                      f"cwnd={cc_stats['cwnd']}, in_flight={cc_stats['bytes_in_flight']}")
+        
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if self.debug and packets_sent > 0:
+            throughput = (sent * 8) / elapsed / 1000 if elapsed > 0 else 0
+            print(f"      ✅ Write complete: {sent} bytes, {packets_sent} packets, "
+                  f"{elapsed*1000:.1f}ms, {throughput:.1f} kbps")
+        
+        return len(data)  # Return original data size (not frame size)
+    
+    async def finish(self, stream_id: int):
+        """
+        Finish writing to a stream (send FIN).
+        
+        Args:
+            stream_id: Stream ID to finish
+        """
+        if stream_id not in self._stream_write_offset:
+            raise RuntimeError(f"Stream {stream_id} not open for writing")
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        offset = self._stream_write_offset[stream_id]
+        
+        # Send empty STREAM frame with FIN
+        stream_frame = build_stream_frame(
+            stream_id=stream_id,
+            data=b"",
+            offset=offset,
+            fin=True
+        )
+        
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, stream_frame)
+        pn = self.client_app_pn
+        self.client_app_pn += 1
+        
+        self._track_sent_packet(
+            PacketNumberSpace.APPLICATION,
+            pn,
+            len(packet),
+            frames=[{
+                "type": "STREAM",
+                "stream_id": stream_id,
+                "offset": offset,
+                "data": b"",
+                "fin": True
+            }]
+        )
+        
+        self.send(packet)
+        
+        # Clean up write state
+        del self._stream_write_offset[stream_id]
+        del self._stream_write_ready[stream_id]
+        
+        if self.debug:
+            print(f"      ✅ Stream {stream_id} finished (FIN sent)")
+    
+    async def read_response(self, stream_id: int, timeout: float = 60.0) -> dict:
+        """
+        Wait for and return the response for a stream.
+        
+        Args:
+            stream_id: Stream ID to read response from
+            timeout: Response timeout in seconds
+            
+        Returns:
+            dict: Response with 'status', 'headers', and 'body'
+        """
+        try:
+            # Wait for either response or connection close
+            response_task = asyncio.create_task(self.response_events[stream_id].wait())
+            close_task = asyncio.create_task(self.connection_closed.wait())
+            
+            done, pending = await asyncio.wait(
+                [response_task, close_task],
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+            
+            # Check if connection was closed by peer
+            if close_task in done and self._peer_closed:
+                if self.debug:
+                    print(f"    ❌ Response failed: connection closed by peer (error={self._peer_close_error_code})")
+                return {
+                    "status": None,
+                    "headers": [],
+                    "body": b"",
+                    "error": f"connection_closed (code={self._peer_close_error_code})"
+                }
+            
+            # Check if response received
+            if response_task in done:
+                response = self.pending_responses.get(stream_id, {})
+                return response
+            
+            # Timeout
+            if self.debug:
+                print(f"    ⏱️ Response timeout for stream {stream_id}")
+            return {
+                "status": None,
+                "headers": [],
+                "body": b"",
+                "error": "timeout"
+            }
+            
+        except asyncio.TimeoutError:
+            if self.debug:
+                print(f"    ⏱️ Response timeout for stream {stream_id}")
+            return {
+                "status": None,
+                "headers": [],
+                "body": b"",
+                "error": "timeout"
+            }
+    
     def process_udp_packet(self, data: bytes):
         """Process a received UDP datagram."""
+        # Ignore packets after peer has closed the connection (draining state)
+        if self._peer_closed:
+            return
+        
         recv_time = time.time()
         
         self.packets_received += 1
@@ -2766,17 +3688,50 @@ class RealtimeQUICClient:
                 print(f"    ⏱️ 0-RTT handshake timeout")
             return {"status": None, "headers": [], "body": b"", "error": "handshake timeout", "0rtt": True}
         
-        # Wait for response
+        # Wait for response or connection close
         try:
-            await asyncio.wait_for(
-                self.response_events[stream_id].wait(),
-                timeout=timeout / 2
+            response_task = asyncio.create_task(self.response_events[stream_id].wait())
+            close_task = asyncio.create_task(self.connection_closed.wait())
+            
+            done, pending = await asyncio.wait(
+                [response_task, close_task],
+                timeout=timeout / 2,
+                return_when=asyncio.FIRST_COMPLETED
             )
             
-            response = self.pending_responses.get(stream_id, {})
-            response["0rtt"] = True
-            response["0rtt_accepted"] = self.zero_rtt_accepted
-            return response
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+            
+            # Check if connection was closed by peer
+            if close_task in done and self._peer_closed:
+                if self.debug:
+                    print(f"    ❌ 0-RTT response failed: connection closed by peer (error={self._peer_close_error_code})")
+                return {
+                    "status": None,
+                    "headers": [],
+                    "body": b"",
+                    "error": f"connection_closed (code={self._peer_close_error_code})",
+                    "0rtt": True
+                }
+            
+            # Check if response received
+            if response_task in done:
+                response = self.pending_responses.get(stream_id, {})
+                response["0rtt"] = True
+                response["0rtt_accepted"] = self.zero_rtt_accepted
+                return response
+            
+            # Timeout
+            if self.debug:
+                print(f"    ⏱️ 0-RTT response timeout for stream {stream_id}")
+            return {
+                "status": None,
+                "headers": [],
+                "body": b"",
+                "error": "response timeout",
+                "0rtt": True
+            }
             
         except asyncio.TimeoutError:
             if self.debug:

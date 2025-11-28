@@ -6,6 +6,7 @@ Implements:
 - ACK-based loss detection
 - Probe Timeout (PTO) for detecting losses
 - Retransmission of lost frames
+- Congestion control with slow start and congestion avoidance
 """
 
 import time
@@ -13,6 +14,207 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Callable, Any
 from collections import OrderedDict
+
+
+# =============================================================================
+# Congestion Control (RFC 9002 Section 7)
+# =============================================================================
+
+class CongestionState(Enum):
+    """Congestion control states."""
+    SLOW_START = "slow_start"
+    CONGESTION_AVOIDANCE = "congestion_avoidance"
+    RECOVERY = "recovery"
+
+
+class CongestionController:
+    """
+    QUIC Congestion Controller implementing NewReno-style congestion control.
+    
+    Based on RFC 9002 Section 7:
+    - Slow start: cwnd grows exponentially until ssthresh
+    - Congestion avoidance: cwnd grows linearly after ssthresh
+    - Recovery: multiplicative decrease on packet loss
+    """
+    
+    # Constants from RFC 9002 Section 7.2
+    kInitialWindow = 14720  # 10 * 1200 bytes (default MTU), rounded to nearest packet
+    kMinimumWindow = 2 * 1200  # 2 packets
+    kLossReductionFactor = 0.5  # Multiplicative decrease factor
+    kMaxDatagramSize = 1200  # Conservative MTU for QUIC
+    
+    def __init__(self, debug: bool = False):
+        self.debug = debug
+        
+        # Congestion window (in bytes)
+        self.cwnd: int = self.kInitialWindow
+        
+        # Slow start threshold
+        self.ssthresh: int = float('inf')  # Initially unlimited
+        
+        # Current state
+        self.state: CongestionState = CongestionState.SLOW_START
+        
+        # Bytes in flight across all packet number spaces
+        self.bytes_in_flight: int = 0
+        
+        # Recovery state
+        self.recovery_start_time: Optional[float] = None
+        self.congestion_recovery_start_time: Optional[float] = None
+        
+        # ECN support (simplified - not fully implemented)
+        self.ecn_ce_counters: Dict[str, int] = {
+            "initial": 0,
+            "handshake": 0, 
+            "application": 0
+        }
+        
+        # Statistics
+        self.total_bytes_sent: int = 0
+        self.total_bytes_acked: int = 0
+        self.total_bytes_lost: int = 0
+        
+    def on_packet_sent(self, sent_bytes: int, in_flight: bool = True):
+        """
+        Called when a packet is sent.
+        
+        Args:
+            sent_bytes: Size of the packet
+            in_flight: Whether packet counts towards bytes in flight
+        """
+        if in_flight:
+            self.bytes_in_flight += sent_bytes
+            self.total_bytes_sent += sent_bytes
+            
+    def on_packet_acked(self, sent_bytes: int, sent_time: float, now: float):
+        """
+        Called when a packet is acknowledged.
+        
+        Args:
+            sent_bytes: Size of the acknowledged packet
+            sent_time: Time the packet was sent
+            now: Current time
+        """
+        self.bytes_in_flight = max(0, self.bytes_in_flight - sent_bytes)
+        self.total_bytes_acked += sent_bytes
+        
+        # Don't grow cwnd during recovery
+        if self.congestion_recovery_start_time is not None:
+            if sent_time <= self.congestion_recovery_start_time:
+                # Packet was sent before recovery started, don't grow cwnd
+                return
+            else:
+                # Packet sent after recovery started, exit recovery
+                self.congestion_recovery_start_time = None
+                if self.debug:
+                    print(f"    📈 Exiting congestion recovery")
+        
+        # Update cwnd based on state
+        if self.state == CongestionState.SLOW_START:
+            # Slow start: increase cwnd by sent_bytes (exponential growth)
+            self.cwnd += sent_bytes
+            
+            if self.cwnd >= self.ssthresh:
+                self.state = CongestionState.CONGESTION_AVOIDANCE
+                if self.debug:
+                    print(f"    📊 Entering congestion avoidance: cwnd={self.cwnd}, ssthresh={self.ssthresh}")
+                    
+        elif self.state == CongestionState.CONGESTION_AVOIDANCE:
+            # Congestion avoidance: increase cwnd by ~1 MSS per RTT
+            # Approximation: cwnd += MSS * sent_bytes / cwnd
+            self.cwnd += (self.kMaxDatagramSize * sent_bytes) // self.cwnd
+            
+        if self.debug:
+            self._log_state("ACK")
+            
+    def on_packets_lost(self, lost_bytes: int, sent_time: float, now: float):
+        """
+        Called when packets are detected as lost.
+        
+        Args:
+            lost_bytes: Total bytes in lost packets
+            sent_time: Time the earliest lost packet was sent
+            now: Current time
+        """
+        self.bytes_in_flight = max(0, self.bytes_in_flight - lost_bytes)
+        self.total_bytes_lost += lost_bytes
+        
+        # Check if we're already in recovery for these packets
+        if self.congestion_recovery_start_time is not None:
+            if sent_time <= self.congestion_recovery_start_time:
+                # Already in recovery period, don't reduce again
+                if self.debug:
+                    print(f"    📉 Loss during recovery (no cwnd reduction)")
+                return
+        
+        # Enter recovery
+        self.congestion_recovery_start_time = now
+        
+        # Multiplicative decrease
+        self.cwnd = max(
+            int(self.cwnd * self.kLossReductionFactor),
+            self.kMinimumWindow
+        )
+        self.ssthresh = self.cwnd
+        self.state = CongestionState.RECOVERY
+        
+        if self.debug:
+            print(f"    📉 Packet loss detected: cwnd reduced to {self.cwnd}, ssthresh={self.ssthresh}")
+            self._log_state("LOSS")
+            
+    def on_persistent_congestion(self):
+        """
+        Called when persistent congestion is detected.
+        Resets cwnd to minimum window.
+        """
+        self.cwnd = self.kMinimumWindow
+        self.ssthresh = self.cwnd
+        self.congestion_recovery_start_time = None
+        self.state = CongestionState.SLOW_START
+        
+        if self.debug:
+            print(f"    🔴 Persistent congestion: cwnd reset to {self.cwnd}")
+            
+    def can_send(self, bytes_to_send: int) -> bool:
+        """
+        Check if we can send more data based on congestion window.
+        
+        Args:
+            bytes_to_send: Number of bytes to send
+            
+        Returns:
+            bool: True if we can send, False if congestion window is full
+        """
+        return self.bytes_in_flight + bytes_to_send <= self.cwnd
+    
+    def available_cwnd(self) -> int:
+        """
+        Get available space in congestion window.
+        
+        Returns:
+            int: Available bytes that can be sent
+        """
+        return max(0, self.cwnd - self.bytes_in_flight)
+    
+    def _log_state(self, event: str):
+        """Log congestion control state."""
+        if self.debug:
+            print(f"      📊 CC [{event}]: state={self.state.value}, "
+                  f"cwnd={self.cwnd}, ssthresh={self.ssthresh}, "
+                  f"in_flight={self.bytes_in_flight}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get congestion control statistics."""
+        return {
+            "state": self.state.value,
+            "cwnd": self.cwnd,
+            "ssthresh": self.ssthresh if self.ssthresh != float('inf') else "inf",
+            "bytes_in_flight": self.bytes_in_flight,
+            "available_cwnd": self.available_cwnd(),
+            "total_bytes_sent": self.total_bytes_sent,
+            "total_bytes_acked": self.total_bytes_acked,
+            "total_bytes_lost": self.total_bytes_lost,
+        }
 
 
 class PacketNumberSpace(Enum):
@@ -137,6 +339,7 @@ class LossDetector:
     - Time threshold loss detection
     - Packet threshold loss detection  
     - Probe timeout (PTO)
+    - Congestion control with slow start and congestion avoidance
     """
     
     # Constants from RFC 9002
@@ -150,6 +353,9 @@ class LossDetector:
         
         # RTT estimation
         self.rtt = RTTEstimate()
+        
+        # Congestion controller
+        self.cc = CongestionController(debug=debug)
         
         # State per packet number space
         self.spaces: Dict[PacketNumberSpace, LossDetectionState] = {
@@ -196,6 +402,8 @@ class LossDetector:
         
         if in_flight:
             state.bytes_in_flight += sent_bytes
+            # Update congestion controller
+            self.cc.on_packet_sent(sent_bytes, in_flight=True)
         
         if ack_eliciting:
             state.time_of_last_ack_eliciting_packet = sent_info.sent_time
@@ -239,6 +447,8 @@ class LossDetector:
                         
                         if sent_info.in_flight:
                             state.bytes_in_flight -= sent_info.sent_bytes
+                            # Update congestion controller
+                            self.cc.on_packet_acked(sent_info.sent_bytes, sent_info.sent_time, now)
                         
                         if self.debug:
                             print(f"    ✓ Packet acknowledged: space={space.value}, PN={pn}")
@@ -267,6 +477,13 @@ class LossDetector:
         
         if lost_packets:
             state.packets_lost += len(lost_packets)
+            
+            # Update congestion controller for lost packets
+            total_lost_bytes = sum(p.sent_bytes for p in lost_packets if p.in_flight)
+            if total_lost_bytes > 0:
+                earliest_lost_time = min(p.sent_time for p in lost_packets)
+                self.cc.on_packets_lost(total_lost_bytes, earliest_lost_time, now)
+            
             if self.on_packets_lost:
                 self.on_packets_lost(space, lost_packets)
         

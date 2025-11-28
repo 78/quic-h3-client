@@ -324,6 +324,42 @@ def encode_qpack_string(s: str, huffman: bool = False) -> bytes:
     return length_encoded + data
 
 
+def encode_literal_with_name_ref(name_idx: int, value: str, static: bool = True) -> bytes:
+    """
+    Encode a literal header field with name reference (RFC 9204 Section 4.5.4).
+    
+    Format: 01 N T Index(4+) + H Value_Length(7+) + Value
+    - N = 0 (never indexed)
+    - T = 1 for static table, 0 for dynamic table
+    
+    Args:
+        name_idx: Index of the name in the table
+        value: Header value
+        static: True for static table reference
+        
+    Returns:
+        bytes: Encoded header field
+    """
+    # Base byte: 01NT = 0x50 for static (T=1), 0x40 for dynamic (T=0)
+    base = 0x50 if static else 0x40
+    
+    # 4-bit prefix for index
+    if name_idx < 15:
+        result = bytes([base | name_idx])
+    else:
+        result = bytes([base | 0x0f])
+        # Encode remaining value with variable-length encoding
+        remaining = name_idx - 15
+        while remaining >= 128:
+            result += bytes([(remaining & 0x7f) | 0x80])
+            remaining >>= 7
+        result += bytes([remaining])
+    
+    # Append encoded value
+    result += encode_qpack_string(value)
+    return result
+
+
 def build_qpack_request_headers(method: str, scheme: str, authority: str, path: str, 
                                  extra_headers: dict = None) -> bytes:
     """
@@ -357,14 +393,12 @@ def build_qpack_request_headers(method: str, scheme: str, authority: str, path: 
     
     if method_idx is not None:
         # Indexed header field (static table) - RFC 9204 Section 4.5.2
-        # Format: 1 T Index(6+), T=1 for static table -> 11xxxxxx = 0xc0 | index
-        encoded += bytes([0xc0 | (method_idx & 0x3f)])
+        # Format: 1 T Index(6+), T=1 for static table
+        encoded += bytes([0xc0 | method_idx])  # method_idx is always < 63
     else:
         # Literal with name reference (static) - RFC 9204 Section 4.5.4
-        # Format: 01 N T Index(4+), N=0, T=1 -> 0101xxxx = 0x50 | index
         name_idx = QPACK_STATIC_TABLE_BY_NAME.get(':method', [(15, '')])[0][0]
-        encoded += bytes([0x50 | (name_idx & 0x0f)])
-        encoded += encode_qpack_string(method)
+        encoded += encode_literal_with_name_ref(name_idx, method, static=True)
     
     # Encode :scheme
     scheme_lower = scheme.lower()
@@ -376,25 +410,22 @@ def build_qpack_request_headers(method: str, scheme: str, authority: str, path: 
     
     if scheme_idx is not None:
         # Indexed header field (static table)
-        encoded += bytes([0xc0 | (scheme_idx & 0x3f)])
+        encoded += bytes([0xc0 | scheme_idx])  # scheme_idx is always < 63
     else:
         name_idx = QPACK_STATIC_TABLE_BY_NAME.get(':scheme', [(22, '')])[0][0]
-        encoded += bytes([0x50 | (name_idx & 0x0f)])
-        encoded += encode_qpack_string(scheme)
+        encoded += encode_literal_with_name_ref(name_idx, scheme, static=True)
     
     # Encode :authority (literal with name reference from static table)
-    authority_name_idx = 0  # :authority is at index 0
-    encoded += bytes([0x50 | (authority_name_idx & 0x0f)])
-    encoded += encode_qpack_string(authority)
+    # :authority is at index 0
+    encoded += encode_literal_with_name_ref(0, authority, static=True)
     
     # Encode :path
     if path == '/':
         # Index 1 is ":path" = "/" - indexed field from static table
         encoded += bytes([0xc0 | 1])
     else:
-        path_name_idx = 1  # :path is at index 1
-        encoded += bytes([0x50 | (path_name_idx & 0x0f)])
-        encoded += encode_qpack_string(path)
+        # :path is at index 1
+        encoded += encode_literal_with_name_ref(1, path, static=True)
     
     # Encode extra headers
     if extra_headers:
@@ -407,23 +438,50 @@ def build_qpack_request_headers(method: str, scheme: str, authority: str, path: 
                 for idx, static_val in QPACK_STATIC_TABLE_BY_NAME[name_lower]:
                     if static_val == value:
                         # Full match - indexed field from static table
-                        encoded += bytes([0xc0 | (idx & 0x3f)])
+                        # Use 6-bit prefix encoding for indexed field
+                        if idx < 63:
+                            encoded += bytes([0xc0 | idx])
+                        else:
+                            # Index >= 63 needs variable-length encoding
+                            encoded += bytes([0xc0 | 0x3f])
+                            remaining = idx - 63
+                            while remaining >= 128:
+                                encoded += bytes([(remaining & 0x7f) | 0x80])
+                                remaining >>= 7
+                            encoded += bytes([remaining])
                         found = True
                         break
                 
                 if not found:
                     # Name only match - literal with name reference from static table
                     name_idx = QPACK_STATIC_TABLE_BY_NAME[name_lower][0][0]
-                    encoded += bytes([0x50 | (name_idx & 0x0f)])
-                    encoded += encode_qpack_string(value)
+                    encoded += encode_literal_with_name_ref(name_idx, value, static=True)
                     found = True
             
             if not found:
                 # Literal with literal name - RFC 9204 Section 4.5.6
-                # Format: 001 N H Name Length(3+) Name H Value Length(7+) Value
-                # N=0, H=0 -> 00100000 = 0x20
-                encoded += bytes([0x20])
-                encoded += encode_qpack_string(name_lower)
+                # Format: 001 N H NameLen(3+) Name H ValueLen(7+) Value
+                # N=0, H=0 (no Huffman)
+                name_bytes = name_lower.encode('utf-8')
+                
+                # First byte: 001 N=0 H=0 NameLen(3-bit prefix)
+                # 0x20 = 00100000, last 3 bits for name length prefix
+                if len(name_bytes) < 7:
+                    # Name length fits in 3-bit prefix
+                    encoded += bytes([0x20 | len(name_bytes)])
+                else:
+                    # Name length >= 7, needs multi-byte encoding
+                    encoded += bytes([0x27])  # 0x20 | 0x07 (all prefix bits set)
+                    remaining = len(name_bytes) - 7
+                    while remaining >= 128:
+                        encoded += bytes([(remaining & 0x7f) | 0x80])
+                        remaining >>= 7
+                    encoded += bytes([remaining])
+                
+                # Name string (raw bytes, no H bit / length prefix)
+                encoded += name_bytes
+                
+                # Value with H=0 and 7-bit length prefix
                 encoded += encode_qpack_string(value)
     
     return encoded
