@@ -41,11 +41,42 @@ class H3StreamManager:
         self.qpack_decoder_stream_id = None
         self.peer_settings = {}
         self.local_settings = {
-            H3_SETTINGS_MAX_TABLE_CAPACITY: 4096,
-            H3_SETTINGS_BLOCKED_STREAMS: 100,
+            H3_SETTINGS_MAX_TABLE_CAPACITY: 0,  # We don't use dynamic table
+            H3_SETTINGS_BLOCKED_STREAMS: 0,
         }
+        
         # Request stream responses
         self.responses = {}  # stream_id -> {"headers": [], "data": bytes, "complete": bool}
+    
+    def _merge_pending_chunks(self, stream: dict, debug: bool = False):
+        """
+        Merge any pending out-of-order chunks that are now contiguous.
+        
+        Args:
+            stream: Stream state dictionary
+            debug: Enable debug output
+        """
+        pending = stream["pending_chunks"]
+        merged = True
+        
+        while merged and pending:
+            merged = False
+            # Find chunks that can be merged
+            for offset in sorted(pending.keys()):
+                if offset <= stream["contiguous_end"]:
+                    data = pending.pop(offset)
+                    end_offset = offset + len(data)
+                    
+                    if end_offset > stream["contiguous_end"]:
+                        # Append the non-overlapping part
+                        new_start = stream["contiguous_end"] - offset
+                        stream["buffer"].extend(data[new_start:])
+                        stream["contiguous_end"] = end_offset
+                        merged = True
+                        
+                        if debug:
+                            print(f"    🔗 Merged buffered chunk at offset {offset}, contiguous_end now {stream['contiguous_end']}")
+                    break
     
     def process_stream_data(self, stream_id: int, offset: int, data: bytes, 
                            fin: bool = False, debug: bool = False) -> list:
@@ -68,21 +99,40 @@ class H3StreamManager:
         if stream_id not in self.streams:
             self.streams[stream_id] = {
                 "type": None,
-                "buffer": bytearray(),
-                "expected_offset": 0,
+                "buffer": bytearray(),           # Contiguous data buffer
+                "contiguous_end": 0,             # End of contiguous data
+                "pending_chunks": {},            # offset -> data for out-of-order chunks
+                "fin_offset": None,              # Final offset if FIN received
             }
         
         stream = self.streams[stream_id]
         
-        # Check for out-of-order data
-        if offset != stream["expected_offset"]:
-            if debug:
-                print(f"    ⚠️  Stream {stream_id}: Expected offset {stream['expected_offset']}, got {offset}")
-            # For simplicity, we'll store the data at the correct position
-            # In production, implement proper reassembly
+        # Store FIN offset if received
+        if fin:
+            stream["fin_offset"] = offset + len(data)
         
-        stream["buffer"].extend(data)
-        stream["expected_offset"] = offset + len(data)
+        # Handle data reassembly
+        if offset == stream["contiguous_end"]:
+            # Data is in order - append directly
+            stream["buffer"].extend(data)
+            stream["contiguous_end"] += len(data)
+            
+            # Check if any pending chunks can now be merged
+            self._merge_pending_chunks(stream, debug)
+        elif offset > stream["contiguous_end"]:
+            # Out of order - store for later
+            stream["pending_chunks"][offset] = data
+            if debug:
+                print(f"    📦 Stream {stream_id}: Buffering out-of-order data at offset {offset} (expecting {stream['contiguous_end']})")
+        else:
+            # Overlapping or duplicate data - check for gaps
+            end_offset = offset + len(data)
+            if end_offset > stream["contiguous_end"]:
+                # Partial new data
+                new_start = stream["contiguous_end"] - offset
+                stream["buffer"].extend(data[new_start:])
+                stream["contiguous_end"] = end_offset
+                self._merge_pending_chunks(stream, debug)
         
         # Determine stream type (client vs server, bidirectional vs unidirectional)
         initiator = "client" if (stream_id & 0x01) == 0 else "server"
@@ -97,6 +147,7 @@ class H3StreamManager:
             stream_type, consumed = decode_varint(bytes(stream["buffer"]), 0)
             stream["type"] = stream_type
             stream["type_name"] = H3_STREAM_TYPE_NAMES.get(stream_type, f"Unknown(0x{stream_type:02x})")
+            stream["type_len"] = consumed  # Store stream type length
             
             if debug:
                 print(f"        Stream type: {stream['type_name']} (0x{stream_type:02x})")
@@ -154,6 +205,7 @@ class H3StreamManager:
     def _process_request_stream_response(self, stream_id: int, stream: dict, 
                                          fin: bool, debug: bool, results: list):
         """Process HTTP/3 response frames on a request stream."""
+        # Only process contiguous data from buffer
         frame_data = bytes(stream["buffer"])
         if len(frame_data) == 0:
             return
@@ -200,7 +252,8 @@ class H3StreamManager:
             response["parsed_offset"] = offset
             
             if frame_type == 0x01:  # HEADERS
-                headers = decode_qpack_headers(payload, debug)
+                # Decode headers (static table only)
+                headers = decode_qpack_headers(payload, debug=debug)
                 response["headers"].extend(headers)
                 
                 if debug:
@@ -231,8 +284,13 @@ class H3StreamManager:
                     "data": payload,
                 })
         
-        # Mark complete if FIN received
-        if fin:
+        # Mark complete if FIN received and all data is contiguous
+        fin_offset = stream.get("fin_offset")
+        all_data_received = (fin_offset is not None and 
+                            stream["contiguous_end"] >= fin_offset and
+                            not stream.get("pending_chunks"))
+        
+        if all_data_received and not response["complete"]:
             response["complete"] = True
             if debug:
                 print(f"          ✅ Response complete for stream {stream_id}")
@@ -255,4 +313,3 @@ class H3StreamManager:
         if stream_id in self.streams:
             return self.streams[stream_id].get("type")
         return None
-

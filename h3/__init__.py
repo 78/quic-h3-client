@@ -3,7 +3,7 @@ HTTP/3 Protocol Implementation (RFC 9114)
 
 Provides:
 - HTTP/3 frame building and parsing
-- QPACK header compression (basic)
+- QPACK header compression (static table only)
 - Stream management
 """
 

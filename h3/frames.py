@@ -680,6 +680,9 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
     """
     Decode QPACK encoded headers (RFC 9204).
     
+    Note: This implementation only supports static table references.
+    Dynamic table is not supported as most servers don't use it.
+    
     Args:
         data: QPACK encoded header block
         debug: Enable debug output
@@ -693,7 +696,7 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
     if len(data) < 2:
         return headers
     
-    # Required Insert Count (prefix 8)
+    # Required Insert Count (prefix 8) - RFC 9204 Section 4.5.1
     req_insert_count, consumed = decode_qpack_int(data, offset, 8)
     offset += consumed
     
@@ -711,23 +714,29 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
     while offset < len(data):
         byte = data[offset]
         
-        if byte & 0x80:  # Indexed Header Field (static table)
-            # 1xxxxxxx - static table reference
+        if byte & 0x80:  # Indexed Header Field
+            # 1Txxxxxx - T indicates static(1) or dynamic(0) table
             static_ref = (byte & 0x40) != 0
             index, consumed = decode_qpack_int(data, offset, 6)
             offset += consumed
             
-            if static_ref and index < len(QPACK_STATIC_TABLE):
-                name, value = QPACK_STATIC_TABLE[index]
-                headers.append((name, value))
-                if debug:
-                    print(f"          [{index}] {name}: {value}")
+            if static_ref:
+                # Static table reference
+                if index < len(QPACK_STATIC_TABLE):
+                    name, value = QPACK_STATIC_TABLE[index]
+                    headers.append((name, value))
+                    if debug:
+                        print(f"          [{index}] {name}: {value}")
+                else:
+                    if debug:
+                        print(f"          [static:{index}] (invalid index)")
             else:
+                # Dynamic table reference - not supported
                 if debug:
-                    print(f"          [dynamic:{index}] (not decoded)")
+                    print(f"          ⚠️ [dynamic:{index}] (dynamic table not supported)")
         
         elif byte & 0x40:  # Literal with Name Reference
-            # 01xxxxxx - literal with name reference
+            # 01NTxxxx - N: never index, T: static(1) or dynamic(0)
             static_ref = (byte & 0x10) != 0
             name_idx, consumed = decode_qpack_int(data, offset, 4)
             offset += consumed
@@ -735,24 +744,50 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
             value, consumed = decode_qpack_string(data, offset)
             offset += consumed
             
-            if static_ref and name_idx < len(QPACK_STATIC_TABLE):
-                name = QPACK_STATIC_TABLE[name_idx][0]
+            if static_ref:
+                # Name from static table
+                if name_idx < len(QPACK_STATIC_TABLE):
+                    name = QPACK_STATIC_TABLE[name_idx][0]
+                else:
+                    name = f"[static:{name_idx}]"
             else:
+                # Name from dynamic table - not supported
                 name = f"[dynamic:{name_idx}]"
+                if debug:
+                    print(f"          ⚠️ {name}: {value} (dynamic table not supported)")
             
             headers.append((name, value))
             if debug:
                 print(f"          {name}: {value}")
         
         elif byte & 0x20:  # Literal with Literal Name
-            # 001xxxxx - literal with literal name
-            offset += 1  # Skip the indicator byte
+            # 001NHxxx - N: never index, H: Huffman for name, followed by name and value strings
+            # Name uses 3-bit prefix for length (bits 0-2)
+            # RFC 9204 Section 4.5.6
             
-            # Name (string)
-            name, consumed = decode_qpack_string(data, offset)
-            offset += consumed
+            # Parse name: H bit is bit 3, length uses 3-bit prefix
+            name_huffman = (byte & 0x08) != 0
+            name_length, name_len_consumed = decode_qpack_int(data, offset, 3)
+            offset += name_len_consumed
             
-            # Value (string)
+            if offset + name_length > len(data):
+                break
+            
+            name_bytes = data[offset:offset + name_length]
+            offset += name_length
+            
+            if name_huffman:
+                try:
+                    name = huffman_decode(name_bytes)
+                except:
+                    name = f"[huffman:{name_bytes.hex()}]"
+            else:
+                try:
+                    name = name_bytes.decode('utf-8')
+                except:
+                    name = name_bytes.hex()
+            
+            # Value uses standard 7-bit prefix
             value, consumed = decode_qpack_string(data, offset)
             offset += consumed
             
@@ -761,21 +796,25 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
                 print(f"          {name}: {value}")
         
         elif byte & 0x10:  # Indexed Header Field (post-base)
-            # 0001xxxx - post-base indexed
+            # 0001xxxx - post-base indexed - dynamic table not supported
             index, consumed = decode_qpack_int(data, offset, 4)
             offset += consumed
+            
             if debug:
-                print(f"          [post-base:{index}] (not decoded)")
+                print(f"          ⚠️ [post-base:{index}] (dynamic table not supported)")
         
         else:
-            # 0000xxxx - Literal with Post-Base Name Reference
-            offset += 1
+            # 0000Nxxx - Literal with Post-Base Name Reference
+            # Dynamic table not supported
             name_idx, consumed = decode_qpack_int(data, offset, 3)
             offset += consumed
+            
             value, consumed = decode_qpack_string(data, offset)
             offset += consumed
+            
+            headers.append((f"[post-base-name:{name_idx}]", value))
             if debug:
-                print(f"          [post-base-name:{name_idx}]: {value}")
+                print(f"          ⚠️ [post-base-name:{name_idx}]: {value} (dynamic table not supported)")
     
     return headers
 
