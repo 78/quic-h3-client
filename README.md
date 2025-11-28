@@ -1,6 +1,6 @@
-# HTTP/3 Client Implementation
+# HTTP/3 Client Pure Python Implementation
 
-一个从零实现的 QUIC/HTTP/3 客户端，专为嵌入式设备优化（带宽 2Mbps，仅进行 API HTTP 请求）。
+一个从零实现的 QUIC/HTTP/3 轻型客户端（仅进行 API HTTP 请求），学习研究用。
 
 ## 📋 目录
 
@@ -32,8 +32,6 @@
 
 ### 适用场景
 
-- 嵌入式设备的 API 调用
-- 低带宽环境（2Mbps）
 - 需要快速连接建立的场景（0-RTT）
 - 学习和研究 QUIC/HTTP/3 协议
 
