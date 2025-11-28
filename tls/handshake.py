@@ -209,9 +209,13 @@ def parse_tls_handshake(data: bytes, debug: bool = False) -> list:
         msg_type = data[offset]
         length = struct.unpack(">I", b'\x00' + data[offset+1:offset+4])[0]
         
-        msg_name = HANDSHAKE_TYPE_NAMES.get(msg_type, f"Unknown({msg_type})")
+        # Check if we have the complete message
+        # If not, stop parsing and wait for more data
+        if offset + 4 + length > len(data):
+            break
         
-        msg_data = data[offset+4:offset+4+length] if offset + 4 + length <= len(data) else data[offset+4:]
+        msg_name = HANDSHAKE_TYPE_NAMES.get(msg_type, f"Unknown({msg_type})")
+        msg_data = data[offset+4:offset+4+length]
         
         message = {
             "type": msg_name,

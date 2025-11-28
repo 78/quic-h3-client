@@ -143,6 +143,7 @@ class RealtimeQUICClient:
         self.h3_local_control_stream_id = 2
         self.h3_local_encoder_stream_id = 6
         self.h3_local_decoder_stream_id = 10
+        self.h3_local_decoder_stream_offset = 0  # Track offset for decoder stream
         self.h3_settings = {
             0x01: 4096,  # QPACK_MAX_TABLE_CAPACITY
             0x07: 16,    # QPACK_BLOCKED_STREAMS
@@ -1051,10 +1052,11 @@ class RealtimeQUICClient:
         decoder_stream_frame = build_stream_frame(
             stream_id=self.h3_local_decoder_stream_id,
             data=decoder_stream_data,
-            offset=0,
+            offset=self.h3_local_decoder_stream_offset,
             fin=False
         )
         frames += decoder_stream_frame
+        self.h3_local_decoder_stream_offset += len(decoder_stream_data)
         frame_info_list.append({
             "type": "STREAM",
             "stream_id": self.h3_local_decoder_stream_id,
@@ -1721,6 +1723,13 @@ class RealtimeQUICClient:
                             # Signal that response is ready
                             if resp_stream_id in self.response_events:
                                 self.response_events[resp_stream_id].set()
+                        elif result.get("type") == "qpack_table_updated":
+                            if self.debug:
+                                print(f"          📊 QPACK table updated: {result.get('new_entries')} new entries")
+                    
+                    # Send any pending QPACK decoder instructions
+                    self._send_qpack_decoder_instructions()
+                    
                 except Exception as e:
                     if self.debug:
                         print(f"          ⚠️ H3 parsing error: {e}")
@@ -1731,6 +1740,38 @@ class RealtimeQUICClient:
                 break
         
         return ack_eliciting
+    
+    def _send_qpack_decoder_instructions(self):
+        """
+        Send pending QPACK decoder instructions on the decoder stream.
+        
+        These include Section Acknowledgment and Insert Count Increment.
+        """
+        if not self.application_secrets:
+            return
+        
+        instructions = self.h3_manager.get_pending_decoder_instructions()
+        if not instructions:
+            return
+        
+        dcid = self.server_scid if self.server_scid else self.original_dcid
+        
+        # Build STREAM frame for decoder stream
+        stream_frame = build_stream_frame(
+            stream_id=self.h3_local_decoder_stream_id,
+            data=instructions,
+            offset=self.h3_local_decoder_stream_offset,
+            fin=False
+        )
+        self.h3_local_decoder_stream_offset += len(instructions)
+        
+        # Build and send 1-RTT packet
+        packet = self._build_short_header_packet(dcid, self.client_app_pn, stream_frame)
+        self.send(packet)
+        self.client_app_pn += 1
+        
+        if self.debug:
+            print(f"    → Sent QPACK decoder instructions ({len(instructions)} bytes)")
     
     def _send_1rtt_ack(self):
         """Send ACK for 1-RTT packets using Short Header."""

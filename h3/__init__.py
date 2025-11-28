@@ -3,7 +3,7 @@ HTTP/3 Protocol Implementation (RFC 9114)
 
 Provides:
 - HTTP/3 frame building and parsing
-- QPACK header compression (static table only)
+- QPACK header compression with dynamic table support
 - Stream management
 """
 
@@ -22,4 +22,11 @@ from .frames import (
     decode_qpack_headers,
 )
 from .streams import H3StreamManager, describe_stream_id
+from .qpack import (
+    QPACKDynamicTable,
+    parse_qpack_encoder_instructions,
+    build_section_acknowledgment,
+    build_stream_cancellation,
+    build_insert_count_increment,
+)
 

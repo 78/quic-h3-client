@@ -9,6 +9,10 @@ from .constants import (
     H3_SETTINGS_MAX_TABLE_CAPACITY, H3_SETTINGS_BLOCKED_STREAMS
 )
 from .frames import parse_h3_frames, decode_qpack_headers
+from .qpack import (
+    QPACKDynamicTable, parse_qpack_encoder_instructions,
+    build_section_acknowledgment, build_insert_count_increment
+)
 
 
 def describe_stream_id(stream_id: int) -> str:
@@ -33,20 +37,35 @@ def describe_stream_id(stream_id: int) -> str:
 class H3StreamManager:
     """
     Manages HTTP/3 streams and reassembles data.
+    
+    Includes QPACK dynamic table management for proper header decompression.
     """
-    def __init__(self):
+    def __init__(self, qpack_max_table_capacity: int = 4096):
         self.streams = {}  # stream_id -> {"type": str, "data": bytes, "offset": int}
         self.control_stream_id = None
         self.qpack_encoder_stream_id = None
         self.qpack_decoder_stream_id = None
         self.peer_settings = {}
         self.local_settings = {
-            H3_SETTINGS_MAX_TABLE_CAPACITY: 0,  # We don't use dynamic table
-            H3_SETTINGS_BLOCKED_STREAMS: 0,
+            H3_SETTINGS_MAX_TABLE_CAPACITY: qpack_max_table_capacity,
+            H3_SETTINGS_BLOCKED_STREAMS: 100,
         }
+        
+        # QPACK dynamic table for decoding server headers
+        self.qpack_dynamic_table = QPACKDynamicTable(max_capacity=qpack_max_table_capacity)
+        
+        # Track encoder stream parsing state
+        self._encoder_stream_parsed_offset = 0
+        
+        # Pending decoder instructions to send
+        self._pending_decoder_instructions = bytearray()
         
         # Request stream responses
         self.responses = {}  # stream_id -> {"headers": [], "data": bytes, "complete": bool}
+    
+    def set_debug(self, debug: bool):
+        """Enable/disable debug output for QPACK table."""
+        self.qpack_dynamic_table.set_debug(debug)
     
     def _merge_pending_chunks(self, stream: dict, debug: bool = False):
         """
@@ -77,6 +96,19 @@ class H3StreamManager:
                         if debug:
                             print(f"    🔗 Merged buffered chunk at offset {offset}, contiguous_end now {stream['contiguous_end']}")
                     break
+    
+    def get_pending_decoder_instructions(self) -> bytes:
+        """
+        Get and clear pending QPACK decoder instructions.
+        
+        These should be sent on the decoder stream.
+        
+        Returns:
+            bytes: Encoded decoder instructions
+        """
+        instructions = bytes(self._pending_decoder_instructions)
+        self._pending_decoder_instructions.clear()
+        return instructions
     
     def process_stream_data(self, stream_id: int, offset: int, data: bytes, 
                            fin: bool = False, debug: bool = False) -> list:
@@ -196,11 +228,60 @@ class H3StreamManager:
                     if frame.get("frame_type") == "SETTINGS":
                         self.peer_settings.update(frame.get("settings", {}))
         
+        # Process QPACK encoder stream - this is critical for dynamic table
+        elif stream["type"] == H3_STREAM_TYPE_QPACK_ENCODER:
+            self._process_qpack_encoder_stream(stream, debug, results)
+        
         # Parse HTTP/3 response on bidirectional request streams
         elif direction == "bidi":
             self._process_request_stream_response(stream_id, stream, fin, debug, results)
         
         return results
+    
+    def _process_qpack_encoder_stream(self, stream: dict, debug: bool, results: list):
+        """
+        Process QPACK encoder stream data.
+        
+        Parses encoder instructions and updates the dynamic table.
+        """
+        buffer = bytes(stream["buffer"])
+        type_len = stream.get("type_len", 1)
+        
+        # Only process new data
+        start_offset = type_len + self._encoder_stream_parsed_offset
+        if start_offset >= len(buffer):
+            return
+        
+        encoder_data = buffer[start_offset:]
+        
+        if debug:
+            print(f"    📨 Processing QPACK encoder instructions ({len(encoder_data)} bytes)")
+        
+        # Parse encoder instructions
+        prev_insert_count = self.qpack_dynamic_table.insert_count
+        consumed = parse_qpack_encoder_instructions(
+            encoder_data, 
+            self.qpack_dynamic_table, 
+            debug=debug
+        )
+        self._encoder_stream_parsed_offset += consumed
+        
+        # If new entries were inserted, send Insert Count Increment
+        new_inserts = self.qpack_dynamic_table.insert_count - prev_insert_count
+        if new_inserts > 0:
+            self._pending_decoder_instructions.extend(
+                build_insert_count_increment(new_inserts)
+            )
+            
+            results.append({
+                "type": "qpack_table_updated",
+                "new_entries": new_inserts,
+                "total_entries": len(self.qpack_dynamic_table),
+                "table_size": self.qpack_dynamic_table.size,
+            })
+            
+            if debug:
+                print(f"    📊 QPACK dynamic table: {len(self.qpack_dynamic_table)} entries, {self.qpack_dynamic_table.size} bytes")
     
     def _process_request_stream_response(self, stream_id: int, stream: dict, 
                                          fin: bool, debug: bool, results: list):
@@ -209,6 +290,9 @@ class H3StreamManager:
         frame_data = bytes(stream["buffer"])
         if len(frame_data) == 0:
             return
+        
+        # Check if we have gaps in the data
+        has_pending = bool(stream.get("pending_chunks"))
         
         # Initialize response tracking
         if stream_id not in self.responses:
@@ -252,14 +336,23 @@ class H3StreamManager:
             response["parsed_offset"] = offset
             
             if frame_type == 0x01:  # HEADERS
-                # Decode headers (static table only)
-                headers = decode_qpack_headers(payload, debug=debug)
+                # Decode headers with dynamic table support
+                headers = decode_qpack_headers(
+                    payload, 
+                    debug=debug, 
+                    dynamic_table=self.qpack_dynamic_table
+                )
                 response["headers"].extend(headers)
                 
                 if debug:
                     print(f"          📋 H3 Response Headers:")
                     for name, value in headers:
                         print(f"             {name}: {value}")
+                
+                # Send Section Acknowledgment for this header block
+                self._pending_decoder_instructions.extend(
+                    build_section_acknowledgment(stream_id)
+                )
                 
                 results.append({
                     "type": "response_headers",
@@ -313,3 +406,4 @@ class H3StreamManager:
         if stream_id in self.streams:
             return self.streams[stream_id].get("type")
         return None
+

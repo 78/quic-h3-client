@@ -676,16 +676,14 @@ def decode_qpack_string(data: bytes, offset: int) -> tuple:
         return string_bytes.hex(), len_consumed + length
 
 
-def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
+def decode_qpack_headers(data: bytes, debug: bool = False, dynamic_table=None) -> list:
     """
     Decode QPACK encoded headers (RFC 9204).
-    
-    Note: This implementation only supports static table references.
-    Dynamic table is not supported as most servers don't use it.
     
     Args:
         data: QPACK encoded header block
         debug: Enable debug output
+        dynamic_table: QPACKDynamicTable instance for dynamic table lookups
         
     Returns:
         list: List of (name, value) tuples
@@ -697,7 +695,8 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
         return headers
     
     # Required Insert Count (prefix 8) - RFC 9204 Section 4.5.1
-    req_insert_count, consumed = decode_qpack_int(data, offset, 8)
+    # Encoded Required Insert Count (ERIC)
+    encoded_insert_count, consumed = decode_qpack_int(data, offset, 8)
     offset += consumed
     
     # Sign bit and Delta Base (prefix 7)
@@ -707,8 +706,51 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
     delta_base, consumed = decode_qpack_int(data, offset, 7)
     offset += consumed
     
+    # Calculate actual Required Insert Count and Base (RFC 9204 Section 4.5.1)
+    if encoded_insert_count == 0:
+        req_insert_count = 0
+        base = 0
+    else:
+        # Decode Required Insert Count
+        # Full Range = 2 * MaxEntries
+        # MaxEntries = floor(QPACK_MAX_TABLE_CAPACITY / 32)
+        max_entries = 4096 // 32 if dynamic_table is None else dynamic_table.max_capacity // 32
+        if max_entries == 0:
+            max_entries = 1  # Avoid division by zero
+        full_range = 2 * max_entries
+        
+        if encoded_insert_count > full_range:
+            # Error case per RFC, but handle gracefully
+            req_insert_count = encoded_insert_count - 1
+        else:
+            # RFC 9204 Section 4.5.1:
+            # MaxValue = TotalNumberOfInserts + MaxEntries
+            # MaxWrapped = floor(MaxValue / FullRange) * FullRange
+            # ReqInsertCount = MaxWrapped + EncodedInsertCount - 1
+            total_inserts = dynamic_table.insert_count if dynamic_table else 0
+            max_value = total_inserts + max_entries
+            max_wrapped = (max_value // full_range) * full_range
+            
+            req_insert_count = max_wrapped + encoded_insert_count - 1
+            
+            # Handle wrap-around case
+            if req_insert_count > max_value:
+                if req_insert_count <= full_range:
+                    # Decompression error per RFC
+                    req_insert_count = 0
+                else:
+                    req_insert_count -= full_range
+    
+    # Calculate Base (RFC 9204 Section 4.5.1)
+    if sign:
+        # Base = ReqInsertCount - DeltaBase - 1
+        base = req_insert_count - delta_base - 1
+    else:
+        # Base = ReqInsertCount + DeltaBase
+        base = req_insert_count + delta_base
+    
     if debug:
-        print(f"        QPACK: req_insert_count={req_insert_count}, delta_base={delta_base}, sign={sign}")
+        print(f"        QPACK: req_insert_count={req_insert_count}, base={base}, delta_base={delta_base}, sign={sign}")
     
     # Parse header field representations
     while offset < len(data):
@@ -731,9 +773,26 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
                     if debug:
                         print(f"          [static:{index}] (invalid index)")
             else:
-                # Dynamic table reference - not supported
-                if debug:
-                    print(f"          ⚠️ [dynamic:{index}] (dynamic table not supported)")
+                # Dynamic table reference (pre-base)
+                # Absolute index = Base - index - 1
+                # Only valid if req_insert_count > 0
+                if req_insert_count == 0:
+                    if debug:
+                        print(f"          ⚠️ [dynamic:{index}] (invalid: req_insert_count=0)")
+                    continue
+                    
+                entry = None
+                if dynamic_table:
+                    entry = dynamic_table.get_for_header_decode(index, base, is_post_base=False)
+                
+                if entry:
+                    name, value = entry
+                    headers.append((name, value))
+                    if debug:
+                        print(f"          [dynamic:{index}→abs:{base - index - 1}] {name}: {value}")
+                else:
+                    if debug:
+                        print(f"          [dynamic:{index}] (not decoded - entry not found)")
         
         elif byte & 0x40:  # Literal with Name Reference
             # 01NTxxxx - N: never index, T: static(1) or dynamic(0)
@@ -751,10 +810,23 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
                 else:
                     name = f"[static:{name_idx}]"
             else:
-                # Name from dynamic table - not supported
-                name = f"[dynamic:{name_idx}]"
-                if debug:
-                    print(f"          ⚠️ {name}: {value} (dynamic table not supported)")
+                # Name from dynamic table (pre-base)
+                # Only valid if req_insert_count > 0
+                if req_insert_count == 0:
+                    name = f"[dynamic:{name_idx}]"
+                    if debug:
+                        print(f"          ⚠️ {name}: {value} (invalid: req_insert_count=0)")
+                    headers.append((name, value))
+                    continue
+                    
+                entry = None
+                if dynamic_table:
+                    entry = dynamic_table.get_for_header_decode(name_idx, base, is_post_base=False)
+                
+                if entry:
+                    name = entry[0]
+                else:
+                    name = f"[dynamic:{name_idx}]"
             
             headers.append((name, value))
             if debug:
@@ -796,25 +868,62 @@ def decode_qpack_headers(data: bytes, debug: bool = False) -> list:
                 print(f"          {name}: {value}")
         
         elif byte & 0x10:  # Indexed Header Field (post-base)
-            # 0001xxxx - post-base indexed - dynamic table not supported
+            # 0001xxxx - post-base indexed (references entries after Base)
             index, consumed = decode_qpack_int(data, offset, 4)
             offset += consumed
             
-            if debug:
-                print(f"          ⚠️ [post-base:{index}] (dynamic table not supported)")
+            # Post-base: absolute index = Base + index
+            # Only valid if req_insert_count > 0
+            if req_insert_count == 0:
+                if debug:
+                    print(f"          ⚠️ [post-base:{index}] (invalid: req_insert_count=0)")
+                continue
+            
+            entry = None
+            if dynamic_table:
+                entry = dynamic_table.get_for_header_decode(index, base, is_post_base=True)
+            
+            if entry:
+                name, value = entry
+                headers.append((name, value))
+                if debug:
+                    print(f"          [post-base:{index}→abs:{base + index}] {name}: {value}")
+            else:
+                if debug:
+                    print(f"          [post-base:{index}] (not decoded - entry not found)")
         
         else:
             # 0000Nxxx - Literal with Post-Base Name Reference
-            # Dynamic table not supported
+            # N: never index, name index uses 3-bit prefix
+            # RFC 9204 Section 4.5.5
             name_idx, consumed = decode_qpack_int(data, offset, 3)
             offset += consumed
             
+            # Value uses standard 7-bit prefix
             value, consumed = decode_qpack_string(data, offset)
             offset += consumed
             
-            headers.append((f"[post-base-name:{name_idx}]", value))
+            # Post-base name reference: absolute index = Base + name_idx
+            # Only valid if req_insert_count > 0
+            if req_insert_count == 0:
+                headers.append((f"[post-base-name:{name_idx}]", value))
+                if debug:
+                    print(f"          ⚠️ [post-base-name:{name_idx}]: {value} (invalid: req_insert_count=0)")
+                continue
+            
+            entry = None
+            if dynamic_table:
+                entry = dynamic_table.get_for_header_decode(name_idx, base, is_post_base=True)
+            
+            if entry:
+                name = entry[0]
+                headers.append((name, value))
+                if debug:
+                    print(f"          [post-base-name:{name_idx}] {name}: {value}")
+            else:
+                headers.append((f"[post-base-name:{name_idx}]", value))
             if debug:
-                print(f"          ⚠️ [post-base-name:{name_idx}]: {value} (dynamic table not supported)")
+                print(f"          [post-base-name:{name_idx}]: {value}")
     
     return headers
 
